@@ -92,6 +92,8 @@ class SAMAudio(BaseModel):
         self.memory_proj = torch.nn.Linear(cfg.text_encoder.dim, cfg.transformer.dim)
         self.timestep_emb = SinusoidalEmbedding(cfg.transformer.dim)
         self.visual_ranker = create_ranker(cfg.visual_ranker)
+        # text_ranker: EnsembleRanker
+        # Ensemble of: sam_audio.ranking.clap.ClapRanker, sam_audio.ranking.judge.JudgeRanker
         self.text_ranker = create_ranker(cfg.text_ranker)
         if cfg.span_predictor is not None:
             self.span_predictor = PEAudioFrame.from_config(
