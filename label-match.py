@@ -58,11 +58,11 @@ else:
     audio_file = input_file
 
 descriptions = [
-    "open and close a closet",
-    "human voice",
+    "opening and closing a closet",
+    "person talking",
     "door slamming",
-    "chopstick clutter",
-    "dishes clutter",
+    "chopstick cluttering",
+    "dishes cluttering",
 ]
 
 # Process inputs
