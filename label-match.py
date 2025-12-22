@@ -34,6 +34,7 @@ parser.add_argument("--segment_seconds", type=float, default=30.0, help="Chunk l
 parser.add_argument("--sample_rate", type=int, default=16000, help="Target sample rate (resample if needed)")
 parser.add_argument("--predict_spans", action="store_true", help="Enable span prediction (slower, may improve quality)")
 parser.add_argument("--reranking_candidates", type=int, default=1, help="Number of candidates to rerank (quality vs speed)")
+parser.add_argument("--detection_threshold", type=float, default=0.5, help="Threshold for event detection")
 args = parser.parse_args()
 
 device = "cuda"
@@ -69,7 +70,8 @@ inputs = transform(audio=audio_file, text=descriptions).to(device)
 
 # Run inference
 with torch.inference_mode():
-    outputs = model(**inputs, return_spans=True)
+    # The default threshold is 0.3. Higher threshold means more strict detection.
+    outputs = model(**inputs, return_spans=True, threshold=args.detection_threshold)
 
 # Print detected time spans for each event
 for description, spans in zip(descriptions, outputs.spans):
