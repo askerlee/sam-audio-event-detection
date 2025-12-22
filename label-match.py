@@ -64,39 +64,17 @@ descriptions = [
     "dishes clutter",
 ]
 
-# -------------------- load + resample once --------------------
-wav, sr = torchaudio.load(input_file)  # wav: (channels, samples)
-seg_samples = max(1, int(round(args.segment_seconds * sr)))
-total_samples = wav.shape[1]
-num_segments = max(1, math.ceil(total_samples / seg_samples))
+# Process inputs
+inputs = transform(audio=audio_file, text=descriptions).to(device)
 
-print(f"Loaded: {input_file} | sr={sr} | chunk={args.segment_seconds}s ({seg_samples} samples) | segments={num_segments}")
+# Run inference
+with torch.inference_mode():
+    outputs = model(**inputs, return_spans=True)
 
-target_chunks = []
-residual_chunks = []
-
-pbar = tqdm(
-    split_waveform(wav, seg_samples),
-    total=num_segments,
-    desc="Matching by Segments",
-    unit="seg",
-    dynamic_ncols=True,
-)
-t0 = 0
-
-for chunk, valid_len in pbar:
-    # Process inputs
-    inputs = transform(audio=[chunk], text=descriptions).to(device)
-
-    # Run inference
-    with torch.inference_mode():
-        outputs = model(**inputs, return_spans=True)
-
-    t0 += args.segment_seconds
-    # Print detected time spans for each event
-    for description, spans in zip(descriptions, outputs.spans):
-        if spans:
-            span_str = ", ".join([f"({start+t0:.2f}s, {end+t0:.2f}s)" for start, end in spans])
-            print(f'"{description}": [{span_str}]')
-        else:
-            print(f'"{description}": No events detected')
+# Print detected time spans for each event
+for description, spans in zip(descriptions, outputs.spans):
+    if spans:
+        span_str = ", ".join([f"({start:.2f}s, {end:.2f}s)" for start, end in spans])
+        print(f'"{description}": [{span_str}]')
+    else:
+        print(f'"{description}": No events detected')

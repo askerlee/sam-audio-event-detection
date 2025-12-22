@@ -3,7 +3,7 @@ import modal
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--gpu", type=str, default="B200")
-parser.add_argument("--image_id", type=str, default="im-QmP3Htx6h1f9BvIIlriEDM")
+parser.add_argument("--image_id", type=str, default="im-5T1G8CzbVxQkxViX13zjVi")
 args = parser.parse_args()
 
 if args.image_id is not None:
@@ -41,7 +41,7 @@ with modal.enable_output():
         gpu=args.gpu,
         timeout=6 * 60 * 60,
         idle_timeout=6 * 60 * 60,
-        volumes={"/hf_cache": hf_vol, "/sam_audio": sam_vol},
+        volumes={"/hf_cache": hf_vol, "/sam-audio-data": sam_vol},
     )
 
 print(sb.object_id)  # sb-...
