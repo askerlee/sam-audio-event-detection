@@ -13,8 +13,11 @@ from typing import Iterable, List, Tuple, Dict, Union, Optional
 from collections import defaultdict
 
 Interval = Tuple[float, float, Tuple[float, float]]   # start, end, (prob_mean, prob_max)
-Interval_str = Tuple[str, str, str]       # start, end, (prob_mean, prob_max)
-# label -> "No events detected" or list of Intervals or list of Interval_strs
+# start, end, "prob_max/prob_mean" (debug mode)
+# or 
+# start, end, "prob_max"           (normal mode)
+Interval_str = Tuple[str, str, str]                   
+# label -> "No events detected" or list of Interval_strs
 Events = Dict[str, Union[str, List[Interval_str]]]
 
 def mmss_to_sec(t: str) -> int:
