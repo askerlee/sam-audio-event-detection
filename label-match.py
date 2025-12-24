@@ -28,22 +28,25 @@ def sec_to_mmss(x: int) -> str:
     return f"{x//60:02d}:{x%60:02d}"
 
 def merge_intervals(intervals: Iterable[Interval], tolerance: float = 0.0) -> List[Interval]:
-    xs = sorted((min(s, e), max(s, e), p) for s, e, p in intervals)  # normalize + sort
+    xs = sorted((s, e, p) for s, e, p in intervals)
     merged: List[Interval] = []
     for s, e, p in xs:
         if not merged:
+            # The first interval.
             merged.append((s, e, p))
             continue
 
         ps, pe, pp = merged[-1]
-        # merge if the gap is small enough
         if s <= pe + tolerance:
+            # merge if the gap is small enough
+            # Take the max prob_mean and prob_max of the two intervals, as the new prob.
             merged[-1] = (ps, max(pe, e), max(pp, p))
         else:
+            # the gap is too large, start a new interval.
             merged.append((s, e, p))
     return merged
 
-def print_overlap_timeline(events: Events, tolerance_sec: int = 0) -> None:
+def print_overlap_timeline(events: Events, tolerance_sec: int = 0, debug=False) -> None:
     """
     Prints segments in time order.
     If events overlap in time, their labels appear together in that segment.
@@ -73,15 +76,18 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0) -> None:
         return
 
     # 2) compress consecutive seconds with same label-set
-    t0 = min(painted_with_labels)
-    t1 = max(painted_with_labels2)
+    t0 = min(painted_with_labels.keys())
+    t1 = max(painted_with_labels2.keys())
 
     seg_start = t0
     curr_labels = painted_with_labels.get(t0, dict())
 
     def print_seg_labels(seg_start: int, seg_end: int, labels: dict):
         if labels:
-            labels_str = ", ".join(f"{label} ({prob})" for label, prob in sorted(labels.items()))
+            if debug:
+                labels_str = ", ".join(f"{label} ({prob})" for label, prob in sorted(labels.items()))
+            else:
+                labels_str = ", ".join(sorted(labels.keys()))
             print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
 
     for t in range(t0 + 1, t1 + 2):  # +2 to flush the last segment
@@ -231,9 +237,7 @@ desc2thres = {
     "door slam": 0.65,
     "chopstick clatter": 0.5,
     "ceramic dish clatter": 0.5,
-    "whisking in bowl": 0.5,
-    "spoon scraping pot": 0.5,
-    "stir-fry sizzle": 0.5,
+    "oil sizzle": 0.5,
     "kitchen clatter": 0.5,
     "water splattering": 0.5,
     "chopping or cutting": 0.4,
@@ -324,4 +328,4 @@ for description in desc2thres.keys():
     #else:
     #    print(f'"{description}": No events detected')
 
-print_overlap_timeline(all_events, tolerance_sec=4)
+print_overlap_timeline(all_events, tolerance_sec=4, debug=args.debug)
