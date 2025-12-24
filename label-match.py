@@ -51,7 +51,8 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0) -> None:
     """
     # Whether a second is associated with multiple labels
     painted_with_labels = defaultdict(dict)  # second -> dict(label: prob)
-
+    # painted_with_labels2: painted_with_labels extended with time tolerance at both ends.
+    painted_with_labels2 = defaultdict(dict)  # second -> dict(label: prob)
     # 1) paint timeline per second (inclusive endpoints)
     for label, spans in events.items():
         if not spans or isinstance(spans, str):  # e.g. "No events detected"
@@ -59,17 +60,21 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0) -> None:
         for a, b, p in spans:
             s, e = mmss_to_sec(a), mmss_to_sec(b)
             assert e >= s, f"Invalid interval: {a}-{b}"
-            s = max(0, s - tolerance_sec)
-            e = e + tolerance_sec
             for t in range(s, e + 1):
                 painted_with_labels[t][label] = p
+
+            # Only add tolerance to the start time, not the end time, 
+            # to avoid adding extra seconds to the end of each event.
+            s = max(0, s - tolerance_sec)
+            for t in range(s, e + 1):
+                painted_with_labels2[t][label] = p
 
     if not painted_with_labels:
         return
 
     # 2) compress consecutive seconds with same label-set
     t0 = min(painted_with_labels)
-    t1 = max(painted_with_labels)
+    t1 = max(painted_with_labels2)
 
     seg_start = t0
     curr_labels = painted_with_labels.get(t0, dict())
@@ -80,7 +85,8 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0) -> None:
             print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
 
     for t in range(t0 + 1, t1 + 2):  # +2 to flush the last segment
-        new_labels = painted_with_labels.get(t, dict())
+        # Get labels from painted_with_labels2 (with time tolerance).
+        new_labels = painted_with_labels2.get(t, dict())
         # If no event is detected at t, new_labels will be empty set.
         # The condition below will hold and the current segment will be printed.
         if new_labels.keys() & curr_labels.keys() == set():
@@ -88,7 +94,7 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0) -> None:
             # print and start a new segment
             print_seg_labels(seg_start, t - 1, curr_labels)
             seg_start = t
-            curr_labels = new_labels
+            curr_labels = painted_with_labels.get(t, dict())
         else:
             # If new_labels and curr_labels share some elements, 
             # merge the label dicts and continue to check
@@ -192,9 +198,9 @@ parser.add_argument("--input_file", type=str, required=True, help="Path to the i
 parser.add_argument("--segment_seconds", type=float, default=120.0, help="Chunk length in seconds (e.g. 5, 10, 30)")
 parser.add_argument("--max_segments", type=int, default=0, help="Maximum number of segments to process (0 = all)")
 parser.add_argument("--sample_rate", type=int, default=48000, help="Target sample rate for event detection")
-parser.add_argument("--weak_thres_discount", type=float, default=0.9, 
+parser.add_argument("--weak_thres_discount", type=float, default=0.8, 
                     help="Discount factor for weak event detection threshold")
-parser.add_argument("--debug", type=str2bool, const=True, default=True, help="Whether to print debug info")
+parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 args = parser.parse_args()
 
 device = "cuda"
@@ -221,10 +227,13 @@ else:
 
 desc2thres = {
     "open and close a closet": 0.5,
-    "human voice": 0.6,
-    "door slams": 0.5,
-    "chopstick clutters": 0.5,
-    "dish clutters": 0.5,
+    "human voice": 0.75,
+    "door slam": 0.65,
+    "chopstick clutter": 0.5,
+    "dish clutter": 0.5,
+    "beat eggs": 0.5,
+    "stir pot": 0.5,
+    "stir fry sizzle": 0.5,
 }
 
 # -------------------- load + resample once --------------------
@@ -267,7 +276,10 @@ for chunk, valid_len in pbar:
     for description, spans in zip(desc2thres.keys(), outputs.spans):
         if spans:
             # Discount the threshold to allow weak events to pass.
-            desc2intervals[description].extend([(float(s) + t0, float(e) + t0, p) for s, e, p in spans])
+            # Filter out events below the discounted threshold here.
+            # p: (prob_mean, prob_max). p[0] is prob_mean.
+            desc2intervals[description].extend([(float(s) + t0, float(e) + t0, p) for s, e, p in spans \
+                                                if p[1] >= desc2thres[description] * args.weak_thres_discount ])
 
     t0 += args.segment_seconds
 
@@ -281,10 +293,12 @@ for description in desc2thres.keys():
             # Filter weak events below threshold.
             if prob_max < desc2thres[description]:
                 continue
-            start_min = int(start) // 60
-            start_sec = int(start) %  60
-            end_min   = int(end)   // 60
-            end_sec   = int(end)   %  60
+            start = round(start)
+            end   = round(end)
+            start_min = start // 60
+            start_sec = start %  60
+            end_min   = end   // 60
+            end_sec   = end   %  60
             if args.debug:
                 span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{prob_max:.2f}/{prob_mean:.2f}"))
             else:
@@ -297,4 +311,4 @@ for description in desc2thres.keys():
     #else:
     #    print(f'"{description}": No events detected')
 
-print_overlap_timeline(all_events, tolerance_sec=1)
+print_overlap_timeline(all_events, tolerance_sec=4)
