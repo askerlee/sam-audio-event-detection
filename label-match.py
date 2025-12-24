@@ -226,14 +226,20 @@ else:
     audio_file = input_file
 
 desc2thres = {
-    "open and close a closet": 0.5,
+    "open and close closet": 0.55,
     "human voice": 0.75,
     "door slam": 0.65,
-    "chopstick clutter": 0.5,
-    "dish clutter": 0.5,
-    "beat eggs": 0.5,
-    "stir pot": 0.5,
-    "stir fry sizzle": 0.5,
+    "chopstick clatter": 0.5,
+    "ceramic dish clatter": 0.5,
+    "whisking in bowl": 0.5,
+    "spoon scraping pot": 0.5,
+    "stir-fry sizzle": 0.5,
+    "kitchen clatter": 0.5,
+    "water pouring": 0.5,
+    "knife cutting": 0.4,
+    "plastic bag rustle": 0.5,
+    "cutlery clinking": 0.5,
+    "thud or rumble": 0.6,
 }
 
 # -------------------- load + resample once --------------------
