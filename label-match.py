@@ -227,7 +227,7 @@ else:
 
 desc2thres = {
     "open and close closet": 0.55,
-    "human voice": 0.75,
+    "human talking": 0.65,
     "door slam": 0.65,
     "chopstick clatter": 0.5,
     "ceramic dish clatter": 0.5,
@@ -235,12 +235,16 @@ desc2thres = {
     "spoon scraping pot": 0.5,
     "stir-fry sizzle": 0.5,
     "kitchen clatter": 0.5,
-    "water pouring": 0.5,
-    "knife cutting": 0.4,
+    "water splattering": 0.5,
+    "chopping or cutting": 0.4,
     "plastic bag rustle": 0.5,
     "cutlery clinking": 0.5,
-    "thud or rumble": 0.6,
+    "thud or thump": 0.6,
+    "clack and clunk": 0.6,
+    # "wind rumble": 0.5, # Remember to filter it from the final results
 }
+
+discarded_descs = {}; # { "wind rumble" }
 
 # -------------------- load + resample once --------------------
 wav, sr = torchaudio.load(input_file)  # wav: (channels, samples)
@@ -292,6 +296,9 @@ for chunk, valid_len in pbar:
 all_events = {}
 
 for description in desc2thres.keys():
+    if description in discarded_descs:
+        continue
+
     spans = merge_intervals(desc2intervals[description], tolerance=2)
     if spans:
         span_strs = []
