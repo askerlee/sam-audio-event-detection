@@ -12,13 +12,29 @@ from tqdm import tqdm
 from typing import Iterable, List, Tuple, Dict, Union, Optional
 from collections import defaultdict
 
-Interval = Tuple[float, float, Tuple[float, float]]   # start, end, (prob_mean, prob_max)
-# start, end, "prob_max/prob_mean" (debug mode)
+Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob_mean, prob_max), dbfs
+# start, end, "prob_max/prob_mean/dbfs"
 # or 
-# start, end, "prob_max"           (normal mode)
-Interval_str = Tuple[str, str, str]                   
+# start, end, dbfs
+Interval_str = Tuple[str, str, str]
 # label -> "No events detected" or list of Interval_strs
 Events = Dict[str, Union[str, List[Interval_str]]]
+
+# For phones with stereo recording, convert to mono using mid-side technique.
+def stereo_to_mono(wav: torch.Tensor) -> torch.Tensor:
+    L, R = wav[0], wav[1]
+
+    # L+R (mid) keeps content common to both channels (often voice).
+    mid  = 0.5 * (L + R)
+    # L−R (side) keeps content that differs between channels (sometimes wind/ambient/spatial).
+    side = 0.5 * (L - R)
+
+    # pick the one with higher RMS energy
+    def rms(x): return x.pow(2).mean().sqrt()
+
+    mono = mid if rms(mid) >= rms(side) else side
+    mono = mono.unsqueeze(0)  # [1, T]
+    return mono
 
 def mmss_to_sec(t: str) -> int:
     m, s = t.split(":")
@@ -28,23 +44,56 @@ def sec_to_mmss(x: int) -> str:
     return f"{x//60:02d}:{x%60:02d}"
 
 def merge_intervals(intervals: Iterable[Interval], tolerance: float = 0.0) -> List[Interval]:
-    xs = sorted((s, e, p) for s, e, p in intervals)
+    xs = sorted((s, e, p, db) for s, e, p, db in intervals)
     merged: List[Interval] = []
-    for s, e, p in xs:
+    for s, e, p, db in xs:
         if not merged:
             # The first interval.
-            merged.append((s, e, p))
+            merged.append((s, e, p, db))
             continue
 
-        ps, pe, pp = merged[-1]
-        if s <= pe + tolerance:
+        s0, e0, p0, db0 = merged[-1]
+        if s <= e0 + tolerance:
             # merge if the gap is small enough
             # Take the max prob_mean and prob_max of the two intervals, as the new prob.
-            merged[-1] = (ps, max(pe, e), max(pp, p))
+            merged[-1] = (s0, max(e0, e), max(p0, p), max(db0, db))
         else:
             # the gap is too large, start a new interval.
-            merged.append((s, e, p))
+            merged.append((s, e, p, db))
     return merged
+
+
+# Extract event segments from event_mask and compute dBFS for each
+def extract_event_segments_from_mask(audio: torch.Tensor, mask: torch.Tensor, sample_rate: int,
+                                     db_offset: float) -> List[Tuple[float, float]]:
+    """
+    Extract contiguous True segments from boolean mask and compute dBFS for each.
+    Returns list of (dbfs, duration_seconds) tuples.
+    """
+    segments = []
+    if mask.sum() == 0:
+        return segments
+        
+    # Find boundaries where mask changes from False to True or True to False
+    padded_mask = torch.cat([torch.tensor([False], device=mask.device), mask, torch.tensor([False], device=mask.device)])
+    changes = torch.diff(padded_mask.int())
+    
+    starts = torch.where(changes == 1)[0]  # False -> True transitions
+    ends = torch.where(changes == -1)[0]   # True -> False transitions
+    
+    for start_idx, end_idx in zip(starts, ends):
+        start_idx = start_idx.item()
+        end_idx = end_idx.item()
+        
+        # Extract audio segment
+        segment_audio = audio[:, start_idx:end_idx]
+        if segment_audio.shape[1] > 0:
+            # Compute dBFS for this segment
+            segment_dbfs = calc_dbfs(segment_audio, db_offset)
+            duration_seconds = (end_idx - start_idx) / sample_rate
+            segments.append((segment_dbfs, duration_seconds))
+    
+    return segments
 
 def print_overlap_timeline(events: Events, tolerance_sec: int = 0, debug=False) -> None:
     """
@@ -56,6 +105,8 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0, debug=False) 
     painted_with_labels = defaultdict(dict)  # second -> dict(label: prob)
     # painted_with_labels2: painted_with_labels extended with time tolerance at both ends.
     painted_with_labels2 = defaultdict(dict)  # second -> dict(label: prob)
+    event_boundaries = []
+
     # 1) paint timeline per second (inclusive endpoints)
     for label, spans in events.items():
         if not spans or isinstance(spans, str):  # e.g. "No events detected"
@@ -99,12 +150,22 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0, debug=False) 
             # If new_labels and curr_labels contain no common elements, 
             # print and start a new segment
             print_seg_labels(seg_start, t - 1, curr_labels)
+            # Mark the segment as eventful in event_boundaries.
+            # Note if curr_labels is empty, it means no event is detected in this segment.
+            # So we need to skip inserting event_boundaries in that case.
+            if curr_labels:
+                # Note to use t-1 instead of t as the end, because if we use t, 
+                # after repeating by sr, event_boundaries will delineate one second longer than total_samples.
+                event_boundaries.append((seg_start, t - 1))
+
             seg_start = t
             curr_labels = painted_with_labels.get(t, dict())
         else:
             # If new_labels and curr_labels share some elements, 
             # merge the label dicts and continue to check
             curr_labels = {**curr_labels, **new_labels}
+
+    return event_boundaries
 
 def split_waveform(wav: torch.Tensor, seg_samples: int):
     """
@@ -187,6 +248,12 @@ def PEAudioFrame_forward(
         audio_output=audio_output,
     )
 
+def calc_dbfs(wav: torch.Tensor, db_offset: float) -> float:
+    wav = wav - wav.mean()
+    rms = torch.sqrt(torch.mean(wav**2))
+    dbfs = 20.0 * torch.log10(torch.clamp(rms, min=1e-12)) + db_offset
+    return dbfs.item()
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -206,126 +273,215 @@ parser.add_argument("--max_segments", type=int, default=0, help="Maximum number 
 parser.add_argument("--sample_rate", type=int, default=48000, help="Target sample rate for event detection")
 parser.add_argument("--weak_thres_discount", type=float, default=0.8, 
                     help="Discount factor for weak event detection threshold")
+# This offset has been calibrated by comparing dBFS values measured by the DB meter and those calculated here.
+parser.add_argument("--db_offset", type=float, default=85, help="dBFS offset to add to all detected events' dBFS")
+parser.add_argument("--loud_db_offset", type=float, default=8.0, help="dB offset above average event dBFS to consider an event 'loud'")
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
-args = parser.parse_args()
 
-device = "cuda"
-# Load model and transform
-model = PEAudioFrame.from_config(f"pe-a-frame-{args.model_size}", pretrained=True).to(device)
-transform = PEAudioFrameTransform.from_config(f"pe-a-frame-{args.model_size}")
+def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
+                         input_file: str, segment_seconds: float, sample_rate: int, 
+                         weak_thres_discount: float, db_offset: float, loud_db_offset: float, 
+                         desc2det_thres: Dict[str, float], desc2db_thres: Dict[str, float],
+                         device: str, debug: bool):
+    """
+    Analyze audio file for specific event labels and print detected events with timestamps.
+    """
+    # Define audio file and event descriptions
+    input_trunk = input_file.rsplit(".", 1)[0]
 
-# Patch the forward method to include span detection
-model.forward = PEAudioFrame_forward.__get__(model, PEAudioFrame)
+    # If MP4, extract to WAV once
+    if input_file.lower().endswith(".mp4"):
+        audio_file = input_trunk + ".wav"
+        if not os.path.exists(audio_file):
+            print(f"Extracting audio from {input_file} -> {audio_file} ...")
+            video = AudioSegment.from_file(input_file, format="mp4")
+            video.export(audio_file, format="wav")
+    else:
+        audio_file = input_file
 
-# Define audio file and event descriptions
-input_file = args.input_file
-input_trunk = input_file.rsplit(".", 1)[0]
+    # -------------------- load + resample once --------------------
+    wav, sr = torchaudio.load(input_file)  # wav: (channels, samples)
+    # Video/Audio recorded by phones.
+    if wav.shape[0] == 2:
+        wav = stereo_to_mono(wav)
+    seg_samples = max(1, int(round(segment_seconds * sr)))
+    # total_samples: total points in wav.
+    total_samples = wav.shape[1]
+    num_segments = max(1, math.ceil(total_samples / seg_samples))
 
-# If MP4, extract to WAV once
-if input_file.lower().endswith(".mp4"):
-    audio_file = input_trunk + ".wav"
-    if not os.path.exists(audio_file):
-        print(f"Extracting audio from {input_file} -> {audio_file} ...")
-        video = AudioSegment.from_file(input_file, format="mp4")
-        video.export(audio_file, format="wav")
-else:
-    audio_file = input_file
+    print(f"Loaded: {input_file} | sr={sr} | chunk={segment_seconds}s ({seg_samples} samples) | segments={num_segments}")
+  
+    # -------------------- process each description over chunks --------------------
+    pbar = tqdm(
+        split_waveform(wav, seg_samples),
+        total=num_segments,
+        desc="Matching by Segments",
+        unit="seg",
+        dynamic_ncols=True,
+    )
 
-desc2thres = {
-    "open and close closet": 0.55,
-    "human talking": 0.65,
-    "door slam": 0.65,
-    "chopstick clatter": 0.5,
-    "ceramic dish clatter": 0.5,
-    "oil sizzle": 0.5,
-    "kitchen clatter": 0.5,
-    "water splattering": 0.5,
-    "chopping or cutting": 0.4,
-    "plastic bag rustle": 0.5,
-    "cutlery clinking": 0.5,
-    "thud or thump": 0.6,
-    "clack and clunk": 0.6,
-    # "wind rumble": 0.5, # Remember to filter it from the final results
-}
+    t0 = 0
+    desc2intervals = {desc: [] for desc in desc2det_thres.keys()}
+    event_db_mask = torch.zeros(total_samples, dtype=float).to(device)
 
-discarded_descs = {}; # { "wind rumble" }
+    for chunk, valid_len in pbar:
+        chunk_rs = F.resample(chunk, orig_freq=sr, new_freq=sample_rate)
+        # Process inputs
+        inputs = transform(audio=[chunk_rs], text=list(desc2det_thres.keys()), sampling_rate=sample_rate).to(device)
+        # inputs.input_values have been normalized to [-1.02, 1.02] in the transform.
+        # Run inference
+        with torch.inference_mode():
+            # Discount the minimal threshold a bit to allow "weak (less confident) events" to be detected 
+            # and later merged with adjacent "strong (confident) events".
+            outputs = model(**inputs, return_spans=True, threshold=min(desc2det_thres.values()) * weak_thres_discount, 
+                            return_span_probs=True)
 
-# -------------------- load + resample once --------------------
-wav, sr = torchaudio.load(input_file)  # wav: (channels, samples)
-seg_samples = max(1, int(round(args.segment_seconds * sr)))
-total_samples = wav.shape[1]
-num_segments = max(1, math.ceil(total_samples / seg_samples))
+        # outputs: PEAudioFrameOutput
+        # audio_embeds, text_embeds, spans, audio_output, text_output
+        # Print detected time spans for each event
+        for description, spans in zip(desc2det_thres.keys(), outputs.spans):
+            if spans:
+                # Discount the threshold to allow weak events to pass.
+                # Filter out events below the discounted threshold here.
+                # p: (prob_mean, prob_max). p[0] is prob_mean.
+                for s, e, p in spans:
+                    if p[1] < desc2det_thres[description] * weak_thres_discount:
+                        continue
+                    # NOTE: chunk_rs has been resampled to args.sample_rate.
+                    # But we compute start/end, dbfs in the original chunk.
+                    start_s = float(s)
+                    end_s   = float(e)
+                    start = int(start_s * sr)
+                    end   = min(int(end_s   * sr), valid_len)
+                    global_start_s = start_s + t0
+                    global_start   = int(global_start_s * sr)
+                    global_end_s   = end_s   + t0
+                    global_end     = int(global_end_s * sr)
+                    # Take the span from the original chunk (not resampled).
+                    span_sound = chunk[:, start:end]
+                    dbfs = calc_dbfs(span_sound, db_offset)
+                    # Ignore events below their dBFS thresholds.
+                    if dbfs < desc2db_thres[description]:
+                        continue
+                    # event_db_mask corresponds to the original wav's timeline.
+                    event_db_mask[global_start: global_end] = torch.maximum(event_db_mask[global_start: global_end], torch.tensor(dbfs, device=device))
+                    desc2intervals[description].append((global_start_s, global_end_s, p, dbfs))
 
-print(f"Loaded: {input_file} | sr={sr} | chunk={args.segment_seconds}s ({seg_samples} samples) | segments={num_segments}")
+        t0 += segment_seconds
 
-target_chunks = []
-residual_chunks = []
+    all_events = {}
 
-pbar = tqdm(
-    split_waveform(wav, seg_samples),
-    total=num_segments,
-    desc="Matching by Segments",
-    unit="seg",
-    dynamic_ncols=True,
-)
-
-t0 = 0
-desc2intervals = {desc: [] for desc in desc2thres.keys()}
-
-for chunk, valid_len in pbar:
-    chunk_rs = F.resample(chunk, orig_freq=sr, new_freq=args.sample_rate)
-    # Process inputs
-    inputs = transform(audio=[chunk_rs], text=list(desc2thres.keys()), sampling_rate=args.sample_rate).to(device)
-
-    # Run inference
-    with torch.inference_mode():
-        # Discount the minimal threshold a bit to allow "weak (less confident) events" to be detected 
-        # and later merged with adjacent "strong (confident) events".
-        outputs = model(**inputs, return_spans=True, threshold=min(desc2thres.values()) * args.weak_thres_discount, 
-                        return_span_probs=True)
-
-    # outputs: PEAudioFrameOutput
-    # audio_embeds, text_embeds, spans, audio_output, text_output
-    # Print detected time spans for each event
-    for description, spans in zip(desc2thres.keys(), outputs.spans):
+    for description in desc2det_thres.keys():
+        spans = merge_intervals(desc2intervals[description], tolerance=2)
         if spans:
-            # Discount the threshold to allow weak events to pass.
-            # Filter out events below the discounted threshold here.
-            # p: (prob_mean, prob_max). p[0] is prob_mean.
-            desc2intervals[description].extend([(float(s) + t0, float(e) + t0, p) for s, e, p in spans \
-                                                if p[1] >= desc2thres[description] * args.weak_thres_discount ])
+            span_strs = []
+            for start, end, (prob_mean, prob_max), dbfs in spans:
+                # Filter weak events below threshold.
+                if prob_max < desc2det_thres[description]:
+                    continue
+                start = round(start)
+                end   = round(end)
+                start_min = start // 60
+                start_sec = start %  60
+                end_min   = end   // 60
+                end_sec   = end   %  60
+                if debug:
+                    span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{prob_max:.2f}/{prob_mean:.2f}/{dbfs:.1f}db"))
+                else:
+                    span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{dbfs:.1f}db"))
 
-    t0 += args.segment_seconds
+            all_events[description] = span_strs
 
-all_events = {}
+            #span_str = ", ".join(span_strs)
+            #print(f'"{description}": [{span_str}]')
+        #else:
+        #    print(f'"{description}": No events detected')
 
-for description in desc2thres.keys():
-    if description in discarded_descs:
-        continue
+    print_overlap_timeline(all_events, tolerance_sec=4, debug=debug)
+    wav = wav.to(device)
+    avg_dbfs = calc_dbfs(wav, db_offset)
+    print(f"Average Audio dBFS: {avg_dbfs:.1f}db")
+    if event_db_mask.sum() == 0:
+        print("No events detected, skipping event dBFS analysis.")
+        return
+    nonevent_mask = (event_db_mask == 0)
+    all_nonevent_dbfs = extract_event_segments_from_mask(wav, nonevent_mask, sr, db_offset)
+    avg_nonevent_dbfs = sum(dbfs * dur for dbfs, dur in all_nonevent_dbfs) / sum(dur for _, dur in all_nonevent_dbfs)
+    print(f"Average Non-Event dBFS: {avg_nonevent_dbfs:.1f}db")
 
-    spans = merge_intervals(desc2intervals[description], tolerance=2)
-    if spans:
-        span_strs = []
-        for start, end, (prob_mean, prob_max) in spans:
-            # Filter weak events below threshold.
-            if prob_max < desc2thres[description]:
-                continue
-            start = round(start)
-            end   = round(end)
-            start_min = start // 60
-            start_sec = start %  60
-            end_min   = end   // 60
-            end_sec   = end   %  60
-            if args.debug:
-                span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{prob_max:.2f}/{prob_mean:.2f}"))
-            else:
-                span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{prob_max:.2f}"))
+    event_db_mask_s = torch.nn.functional.interpolate(
+        event_db_mask.unsqueeze(0).unsqueeze(0), 
+        scale_factor=1.0/sr,
+        mode='linear',
+    ).squeeze()
+    # breakpoint()
 
-        all_events[description] = span_strs
+    avg_event_dbfs = event_db_mask[event_db_mask > 0].mean().item()
+    print(f"Average Event dBFS: {avg_event_dbfs:.1f}db")
+    print(f"Duration of All Events:                  {(event_db_mask > 0).sum().item() / sr:.1f} seconds")
+    if (event_db_mask > avg_nonevent_dbfs + loud_db_offset).sum() == 0:
+        print(f"No loud events (> avg + {loud_db_offset}dB) detected.")
+        return
+    print(f"Duration of Loud Events (> avg + {loud_db_offset}dB): {(event_db_mask > avg_nonevent_dbfs + loud_db_offset).sum().item() / sr:.1f} seconds")
+    avg_loud_dbfs = event_db_mask[event_db_mask > avg_nonevent_dbfs + loud_db_offset].mean().item()
+    print(f"Avg dBFS of Loud Events: {avg_loud_dbfs:.1f}db = Average + {avg_loud_dbfs - avg_nonevent_dbfs:.1f}db")
 
-        #span_str = ", ".join(span_strs)
-        #print(f'"{description}": [{span_str}]')
-    #else:
-    #    print(f'"{description}": No events detected')
+if __name__ == "__main__":
+    args = parser.parse_args()
+    device = "cuda"
+    # Load model and transform
+    model = PEAudioFrame.from_config(f"pe-a-frame-{args.model_size}", pretrained=True).to(device)
+    transform = PEAudioFrameTransform.from_config(f"pe-a-frame-{args.model_size}")
 
-print_overlap_timeline(all_events, tolerance_sec=4, debug=args.debug)
+    # Patch the forward method to include span detection
+    model.forward = PEAudioFrame_forward.__get__(model, PEAudioFrame)
+
+    desc2det_thres = {
+        "open and close closet": 0.55,
+        "door slam": 0.65,
+        "chopstick clatter": 0.5,
+        "ceramic dish clatter": 0.5,
+        "kitchen clatter": 0.5,
+        "cutlery clinking": 0.5,
+        "thud or thump": 0.6,
+        "clack and clunk": 0.6,
+        "chopping or cutting": 0.4,
+        "human talking": 0.65,
+        "oil sizzle": 0.5,
+        "water splattering": 0.5,
+        "plastic bag rustle": 0.5,
+    }
+
+    desc2db_thres = {
+        "open and close closet": 55,
+        "door slam": 55,
+        "chopstick clatter": 55,
+        "ceramic dish clatter": 55,
+        "kitchen clatter": 55,
+        "cutlery clinking": 55,
+        "thud or thump": 55,
+        "clack and clunk": 55,
+        "chopping or cutting": 55,
+        # Noises below are generally softer, but still disturbing.
+        # So we set a lower dBFS threshold to catch more of them.
+        "human talking": 50,
+        "oil sizzle": 50,
+        "water splattering": 50,
+        "plastic bag rustle": 50,
+    }
+
+    analyze_audio_labels(
+        model=model,
+        transform=transform,
+        input_file=args.input_file,
+        segment_seconds=args.segment_seconds,
+        sample_rate=args.sample_rate,
+        weak_thres_discount=args.weak_thres_discount,
+        db_offset=args.db_offset,
+        loud_db_offset=args.loud_db_offset,
+        desc2det_thres=desc2det_thres,
+        desc2db_thres=desc2db_thres,
+        device=device,
+        debug=args.debug,
+    )
+    
