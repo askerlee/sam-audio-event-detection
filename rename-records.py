@@ -68,6 +68,8 @@ def main():
     for p in files:
         m = PATTERN.match(p.name)
         if not m:
+            if p.name.endswith(('.mp4', '.wav')):
+                print(f"SKIP  {p.name}: filename does not match pattern")
             continue
 
         prefix = m.group("prefix")

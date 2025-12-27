@@ -11,6 +11,7 @@ from pydub import AudioSegment
 from tqdm import tqdm
 from typing import Iterable, List, Tuple, Dict, Union, Optional
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob_mean, prob_max), dbfs
 # start, end, "prob_max/prob_mean/dbfs"
@@ -19,6 +20,10 @@ Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob
 Interval_str = Tuple[str, str, str]
 # label -> "No events detected" or list of Interval_strs
 Events = Dict[str, Union[str, List[Interval_str]]]
+# Reolink camera recordings.
+PATTERN1 = re.compile(r"(?P<date>\d{8})[/\\](?P<prefix>.+)-(?P<start>\d{6})-(?P<end>\d{6})\.(mp4|wav)$", re.IGNORECASE)
+# Manually recorded videos.
+PATTERN2 = re.compile(r"(?P<prefix>.+)_(?P<date>\d{8})_(?P<start>\d{6})\.(mp4|wav)$", re.IGNORECASE)
 
 # For phones with stereo recording, convert to mono using mid-side technique.
 def stereo_to_mono(wav: torch.Tensor) -> torch.Tensor:
@@ -37,6 +42,7 @@ def stereo_to_mono(wav: torch.Tensor) -> torch.Tensor:
     return mono
 
 def mmss_to_sec(t: str) -> int:
+    # t: "MM:SS" or "MMM:MM:SS"
     m, s = t.split(":")
     return int(m) * 60 + int(s)
 
@@ -95,7 +101,8 @@ def extract_event_segments_from_mask(audio: torch.Tensor, mask: torch.Tensor, sa
     
     return segments
 
-def print_overlap_timeline(events: Events, tolerance_sec: int = 0, debug=False) -> None:
+def print_overlap_timeline(events: Events, start_date_obj: Optional[datetime] = None, 
+                           tolerance_sec: int = 0, debug=False) -> None:
     """
     Prints segments in time order.
     If events overlap in time, their labels appear together in that segment.
@@ -133,13 +140,19 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0, debug=False) 
     seg_start = t0
     curr_labels = painted_with_labels.get(t0, dict())
 
-    def print_seg_labels(seg_start: int, seg_end: int, labels: dict):
+    def print_seg_labels(seg_start: int, seg_end: int, labels: dict, 
+                         start_date_obj: Optional[datetime] = None):
         if labels:
             if debug:
                 labels_str = ", ".join(f"{label} ({prob})" for label, prob in sorted(labels.items()))
             else:
                 labels_str = ", ".join(sorted(labels.keys()))
-            print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
+            if start_date_obj:
+                seg_start_dt = start_date_obj + timedelta(seconds=seg_start)
+                seg_end_dt   = start_date_obj + timedelta(seconds=seg_end)
+                print(f"{seg_start_dt.strftime('%H:%M:%S')}-{seg_end_dt.strftime('%H:%M:%S')}: {labels_str}")
+            else:
+                print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
 
     for t in range(t0 + 1, t1 + 2):  # +2 to flush the last segment
         # Get labels from painted_with_labels2 (with time tolerance).
@@ -149,7 +162,7 @@ def print_overlap_timeline(events: Events, tolerance_sec: int = 0, debug=False) 
         if new_labels.keys() & curr_labels.keys() == set():
             # If new_labels and curr_labels contain no common elements, 
             # print and start a new segment
-            print_seg_labels(seg_start, t - 1, curr_labels)
+            print_seg_labels(seg_start, t - 1, curr_labels, start_date_obj=start_date_obj)
             # Mark the segment as eventful in event_boundaries.
             # Note if curr_labels is empty, it means no event is detected in this segment.
             # So we need to skip inserting event_boundaries in that case.
@@ -276,18 +289,44 @@ parser.add_argument("--weak_thres_discount", type=float, default=0.8,
 # This offset has been calibrated by comparing dBFS values measured by the DB meter and those calculated here.
 parser.add_argument("--db_offset", type=float, default=85, help="dBFS offset to add to all detected events' dBFS")
 parser.add_argument("--loud_db_offset", type=float, default=8.0, help="dB offset above average event dBFS to consider an event 'loud'")
+parser.add_argument("--abs_time", type=str2bool, nargs='?', const=True, default=False, 
+                    help="Whether to print absolute time for timestamps")
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 
 def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
                          input_file: str, segment_seconds: float, sample_rate: int, 
                          weak_thres_discount: float, db_offset: float, loud_db_offset: float, 
                          desc2det_thres: Dict[str, float], desc2db_thres: Dict[str, float],
-                         device: str, debug: bool):
+                         device: str, print_abs_time: bool, debug: bool):
     """
     Analyze audio file for specific event labels and print detected events with timestamps.
     """
     # Define audio file and event descriptions
     input_trunk = input_file.rsplit(".", 1)[0]
+    if print_abs_time:
+        # Try to extract start time from filename
+        m1 = PATTERN1.search(input_file)
+        m2 = PATTERN2.search(input_file)
+        if m1:
+            start_date = m1.group("date")
+            start_time = m1.group("start")
+            # 10262025
+            month, day, year = int(start_date[0:2]), int(start_date[2:4]), int(start_date[4:8])
+            hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
+            start_date_obj = datetime(year, month, day, hr, minute, second)
+        elif m2:
+            start_date = m2.group("date")
+            start_time = m2.group("start")
+            # 20251026
+            year, month, day = int(start_date[0:4]), int(start_date[4:6]), int(start_date[6:8])
+            hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
+            start_date_obj = datetime(year, month, day, hr, minute, second)
+        else:
+            print(f"Warning: Could not extract start time from filename {os.path.basename(input_file)}. Output relative time instead.")
+            print_abs_time = False
+            start_date_obj = None
+    else:
+        start_date_obj = None
 
     # If MP4, extract to WAV once
     if input_file.lower().endswith(".mp4"):
@@ -361,7 +400,8 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     span_sound = chunk[:, start:end]
                     dbfs = calc_dbfs(span_sound, db_offset)
                     # Ignore events below their dBFS thresholds.
-                    if dbfs < desc2db_thres[description]:
+                    # If in debug mode, keep all events for analysis.
+                    if (not debug) and (dbfs < desc2db_thres[description]):
                         continue
                     # event_db_mask corresponds to the original wav's timeline.
                     event_db_mask[global_start: global_end] = torch.maximum(event_db_mask[global_start: global_end], torch.tensor(dbfs, device=device))
@@ -385,6 +425,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                 start_sec = start %  60
                 end_min   = end   // 60
                 end_sec   = end   %  60
+
                 if debug:
                     span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{prob_max:.2f}/{prob_mean:.2f}/{dbfs:.1f}db"))
                 else:
@@ -397,7 +438,8 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
         #else:
         #    print(f'"{description}": No events detected')
 
-    print_overlap_timeline(all_events, tolerance_sec=4, debug=debug)
+    print_overlap_timeline(all_events, start_date_obj=start_date_obj, 
+                           tolerance_sec=4, debug=debug)
     wav = wav.to(device)
     avg_dbfs = calc_dbfs(wav, db_offset)
     print(f"Average Audio dBFS: {avg_dbfs:.1f}db")
@@ -482,6 +524,7 @@ if __name__ == "__main__":
         desc2det_thres=desc2det_thres,
         desc2db_thres=desc2db_thres,
         device=device,
+        print_abs_time=args.abs_time,
         debug=args.debug,
     )
     
