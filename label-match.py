@@ -320,7 +320,11 @@ def calc_dbfs(wav: torch.Tensor, db_offset: float, search_peak_window_len: float
             rms = torch.sqrt(torch.mean(w**2))
             dbfs = 20.0 * torch.log10(torch.clamp(rms, min=1e-12)) + db_offset
             dbfs_values.append(dbfs)
-        dbfs_peak = max(dbfs_values)
+
+        # Take the average of the top 20% highest dBFS values as the peak dBFS.
+        top_20_percent_count = max(1, len(dbfs_values) // 5)
+        top_20_percent_values = sorted(dbfs_values, reverse=True)[:top_20_percent_count]
+        dbfs_peak = sum(top_20_percent_values) / len(top_20_percent_values)
         return dbfs.item(), dbfs_peak.item()
     else:
         return dbfs.item()
@@ -472,8 +476,12 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     # Take the span from the original chunk (not resampled).
                     span_sound = chunk_demeaned[:, start:end]
                     dbfs, dbfs_peak = calc_dbfs(span_sound, db_offset, search_peak_window_len=search_peak_window_sec * sr)
-                    # Use peak dBFS as the event's dBFS.
-                    dbfs = dbfs_peak  
+                    # The loudest part usually determines how disturbing the event is. 
+                    # Also the loudest part will retain in memory for a short while 
+                    # (usually long enough to last through the whole span, and sometimes longer).
+                    # Therefore, we use peak dBFS as the event's dBFS, 
+                    # to better reflect the actual psychological effect of the noise.
+                    dbfs = dbfs_peak
                     # Ignore events below their dBFS thresholds.
                     # If in debug mode, keep all events for analysis.
                     if (not debug) and (dbfs < desc2db_thres[description]):
@@ -571,6 +579,7 @@ if __name__ == "__main__":
     # Patch the forward method to include span detection
     model.forward = PEAudioFrame_forward.__get__(model, PEAudioFrame)
 
+    # Threshold for detection confidence per description
     desc2det_thres = {
         "open and close closet": 0.55,
         "door creak or squeak": 0.55,
@@ -587,6 +596,7 @@ if __name__ == "__main__":
         "plastic bag rustle": 0.5,
     }
 
+    # dBFS threshold per description
     desc2db_thres = {
         "open and close closet": 55,
         "door creak or squeak": 55,
