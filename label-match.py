@@ -10,7 +10,7 @@ import argparse
 from pydub import AudioSegment
 from tqdm import tqdm
 from typing import Iterable, List, Tuple, Dict, Union, Optional
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
 
 Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob_mean, prob_max), dbfs
@@ -20,6 +20,7 @@ Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob
 Interval_str = Tuple[str, str, str]
 # label -> "No events detected" or list of Interval_strs
 Events = Dict[str, Union[str, List[Interval_str]]]
+SpanStat = namedtuple("SpanStat", ["start", "end", "dbfs", "prob_mean", "prob_max"])
 # Reolink camera recordings.
 PATTERN1 = re.compile(r"(?P<date>\d{8})[/\\](?P<prefix>.+)-(?P<start>\d{6})-(?P<end>\d{6})\.(mp4|wav)$", re.IGNORECASE)
 # Manually recorded videos.
@@ -49,7 +50,7 @@ def mmss_to_sec(t: str) -> int:
 def sec_to_mmss(x: int) -> str:
     return f"{x//60:02d}:{x%60:02d}"
 
-def merge_intervals(intervals: Iterable[Interval], tolerance: float = 0.0) -> List[Interval]:
+def merge_intervals(intervals: Iterable[Interval], time_tolerance: float = 0.0, db_max_gap: float = 0.0) -> List[Interval]:
     xs = sorted((s, e, p, db) for s, e, p, db in intervals)
     merged: List[Interval] = []
     for s, e, p, db in xs:
@@ -59,7 +60,7 @@ def merge_intervals(intervals: Iterable[Interval], tolerance: float = 0.0) -> Li
             continue
 
         s0, e0, p0, db0 = merged[-1]
-        if s <= e0 + tolerance:
+        if s <= e0 + time_tolerance and abs(db - db0) <= db_max_gap:
             # merge if the gap is small enough
             # Take the max prob_mean and prob_max of the two intervals, as the new prob.
             merged[-1] = (s0, max(e0, e), max(p0, p), max(db0, db))
@@ -95,91 +96,130 @@ def extract_event_segments_from_mask(audio: torch.Tensor, mask: torch.Tensor, sa
         segment_audio = audio[:, start_idx:end_idx]
         if segment_audio.shape[1] > 0:
             # Compute dBFS for this segment
-            segment_dbfs = calc_dbfs(segment_audio, db_offset)
+            segment_dbfs = calc_dbfs(segment_audio, db_offset, search_peak_window_len=-1)
             duration_seconds = (end_idx - start_idx) / sample_rate
             segments.append((segment_dbfs, duration_seconds))
     
     return segments
 
-def print_overlap_timeline(events: Events, start_date_obj: Optional[datetime] = None, 
-                           tolerance_sec: int = 0, debug=False) -> None:
+def merge_events_along_timeline(events: Events, start_date_obj: Optional[datetime] = None, 
+                                time_tolerance: int = 0, db_max_gap: float = 0.0,
+                                debug=False) -> None:
     """
     Prints segments in time order.
     If events overlap in time, their labels appear together in that segment.
-    tolerance_sec expands each interval by +/- tolerance_sec seconds.
+    time_tolerance expands each interval by +/- time_tolerance seconds.
+    db_max_gap: float, the max gap in dBFS for merging the same event.
+    merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
+    Otherwise, the overlap timeline merging algorithm may not work as expected.
     """
     # Whether a second is associated with multiple labels
-    painted_with_labels = defaultdict(dict)  # second -> dict(label: prob)
-    # painted_with_labels2: painted_with_labels extended with time tolerance at both ends.
-    painted_with_labels2 = defaultdict(dict)  # second -> dict(label: prob)
-    event_boundaries = []
+    seconds_painted_with_labels = defaultdict(dict)  # second -> dict(label: prob)
+    # seconds_painted_with_labels2: seconds_painted_with_labels extended with time tolerance at both ends.
+    seconds_painted_with_labels2 = defaultdict(dict)  # second -> dict(label: prob)
+    seconds_are_labels_in_extended_regions = defaultdict(dict) # second -> dict(label: bool)
 
     # 1) paint timeline per second (inclusive endpoints)
     for label, spans in events.items():
         if not spans or isinstance(spans, str):  # e.g. "No events detected"
             continue
-        for a, b, p in spans:
+        for span_stat in spans:
+            a, b = span_stat.start, span_stat.end
             s, e = mmss_to_sec(a), mmss_to_sec(b)
             assert e >= s, f"Invalid interval: {a}-{b}"
             for t in range(s, e + 1):
-                painted_with_labels[t][label] = p
+                seconds_painted_with_labels[t][label] = span_stat
+
 
             # Only add tolerance to the start time, not the end time, 
             # to avoid adding extra seconds to the end of each event.
-            s = max(0, s - tolerance_sec)
-            for t in range(s, e + 1):
-                painted_with_labels2[t][label] = p
+            # Since time_tolerance is intentionally set to be <= the time_tolerance used in merging events above,
+            # the gaps between adjacent events of the same label are always >= time_tolerance.
+            # Thus, we are sure there is no event of this label in the interval [s - time_tolerance, s - 1].
+            # Setting seconds_painted_with_labels2[t][label] backwards at [s - time_tolerance, ... s - 1]
+            # won't accidentally overwrite a previous event of the same type.
+            s2 = max(0, s - time_tolerance)
+            for t in range(s2, e + 1):
+                seconds_painted_with_labels2[t][label] = span_stat
+            for t in range(s2, s):
+                seconds_are_labels_in_extended_regions[t][label] = True
 
-    if not painted_with_labels:
+    if not seconds_painted_with_labels:
         return
 
     # 2) compress consecutive seconds with same label-set
-    t0 = min(painted_with_labels.keys())
-    t1 = max(painted_with_labels2.keys())
+    t0 = min(seconds_painted_with_labels.keys())
+    t1 = max(seconds_painted_with_labels2.keys())
 
     seg_start = t0
-    curr_labels = painted_with_labels.get(t0, dict())
+    curr_labels = seconds_painted_with_labels.get(t0, dict())
 
-    def print_seg_labels(seg_start: int, seg_end: int, labels: dict, 
+    def print_seg_labels(seg_start: int, seg_end: int, label2span_stat: dict, 
                          start_date_obj: Optional[datetime] = None):
-        if labels:
+        if label2span_stat:
             if debug:
-                labels_str = ", ".join(f"{label} ({prob})" for label, prob in sorted(labels.items()))
+                labels_str = ", ".join(f"{label} ({span_stat.prob_max:.2f}/{span_stat.prob_mean:.2f}/{span_stat.dbfs:.1f}db)" for label, span_stat in sorted(label2span_stat.items()))
             else:
-                labels_str = ", ".join(sorted(labels.keys()))
+                labels_str = ", ".join(f"{label} ({span_stat.dbfs:.1f}db)" for label, span_stat in sorted(label2span_stat.items()))
             if start_date_obj:
                 seg_start_dt = start_date_obj + timedelta(seconds=seg_start)
                 seg_end_dt   = start_date_obj + timedelta(seconds=seg_end)
-                print(f"{seg_start_dt.strftime('%H:%M:%S')}-{seg_end_dt.strftime('%H:%M:%S')}: {labels_str}")
+                abs_time = f"{seg_start_dt.strftime('%H:%M:%S')}-{seg_end_dt.strftime('%H:%M:%S')}"
+                print(f"{abs_time}/{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
             else:
                 print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
 
     for t in range(t0 + 1, t1 + 2):  # +2 to flush the last segment
-        # Get labels from painted_with_labels2 (with time tolerance).
-        new_labels = painted_with_labels2.get(t, dict())
+        # Get labels from seconds_painted_with_labels2 (with time tolerance).
+        new_labels = seconds_painted_with_labels2.get(t, dict())
         # If no event is detected at t, new_labels will be empty set.
         # The condition below will hold and the current segment will be printed.
         if new_labels.keys() & curr_labels.keys() == set():
             # If new_labels and curr_labels contain no common elements, 
             # print and start a new segment
             print_seg_labels(seg_start, t - 1, curr_labels, start_date_obj=start_date_obj)
-            # Mark the segment as eventful in event_boundaries.
-            # Note if curr_labels is empty, it means no event is detected in this segment.
-            # So we need to skip inserting event_boundaries in that case.
-            if curr_labels:
-                # Note to use t-1 instead of t as the end, because if we use t, 
-                # after repeating by sr, event_boundaries will delineate one second longer than total_samples.
-                event_boundaries.append((seg_start, t - 1))
-
             seg_start = t
-            curr_labels = painted_with_labels.get(t, dict())
+            curr_labels = seconds_painted_with_labels.get(t, dict())
         else:
+            merged_labels = {}
+            mergeable = True
             # If new_labels and curr_labels share some elements, 
-            # merge the label dicts and continue to check
-            curr_labels = {**curr_labels, **new_labels}
+            # try to merge the label dicts and continue.
+            are_labels_in_extended_region = seconds_are_labels_in_extended_regions.get(t, dict())
 
-    return event_boundaries
+            for label, span_stat in new_labels.items():
+                if label in curr_labels:
+                    # For the shared label, update to the max prob_mean, prob_max, dbfs.
+                    existing_stat = curr_labels[label]
+                    is_label_in_extended_region = are_labels_in_extended_region.get(label, False)
+                    if (abs(existing_stat.dbfs - span_stat.dbfs) > db_max_gap) and (not is_label_in_extended_region):
+                        # dBFS difference too large, and both spans are not in extended regions, 
+                        # so we cannot merge this label. If a label is not mergeable, 
+                        # then these two spans are not mergeable.
+                        mergeable = False
+                        #breakpoint()
+                        break
+                    # start and end don't matter, as we only use dbfs, prob_mean, prob_max for printing.
+                    # So start and end are simply taken from existing_stat.
+                    merged_stat = SpanStat(
+                        start=existing_stat.start,
+                        end=existing_stat.end,
+                        dbfs=max(existing_stat.dbfs, span_stat.dbfs),
+                        prob_mean=max(existing_stat.prob_mean, span_stat.prob_mean),
+                        prob_max=max(existing_stat.prob_max, span_stat.prob_max),
+                    )
+                    merged_labels[label] = merged_stat
+                else:
+                    merged_labels[label] = span_stat
 
+            if not mergeable:
+                # Cannot merge due to dBFS difference too large
+                print_seg_labels(seg_start, t - 1, curr_labels, start_date_obj=start_date_obj)
+                seg_start = t
+                curr_labels = seconds_painted_with_labels.get(t, dict())
+            else:
+                curr_labels = merged_labels
+                    
 def split_waveform(wav: torch.Tensor, seg_samples: int):
     """
     wav: (channels, samples)
@@ -261,11 +301,29 @@ def PEAudioFrame_forward(
         audio_output=audio_output,
     )
 
-def calc_dbfs(wav: torch.Tensor, db_offset: float) -> float:
-    wav = wav - wav.mean()
+# Assume wav has been demean'ed.
+def calc_dbfs(wav: torch.Tensor, db_offset: float, search_peak_window_len: float=-1) -> float:
     rms = torch.sqrt(torch.mean(wav**2))
     dbfs = 20.0 * torch.log10(torch.clamp(rms, min=1e-12)) + db_offset
-    return dbfs.item()
+
+    if search_peak_window_len > 0:
+        # Search for peak dBFS in sliding windows of length search_peak_window_len (in samples)
+        wav_len = wav.shape[-1]
+        window_len = int(search_peak_window_len)
+        hop_len = window_len // 2
+        dbfs_values = []
+        for start in range(0, wav_len, hop_len):
+            end = start + window_len
+            if end > wav_len:
+                start = wav_len - window_len
+            w = wav[:, start:end]
+            rms = torch.sqrt(torch.mean(w**2))
+            dbfs = 20.0 * torch.log10(torch.clamp(rms, min=1e-12)) + db_offset
+            dbfs_values.append(dbfs)
+        dbfs_peak = max(dbfs_values)
+        return dbfs.item(), dbfs_peak.item()
+    else:
+        return dbfs.item()
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -287,45 +345,55 @@ parser.add_argument("--sample_rate", type=int, default=48000, help="Target sampl
 parser.add_argument("--weak_thres_discount", type=float, default=0.8, 
                     help="Discount factor for weak event detection threshold")
 # This offset has been calibrated by comparing dBFS values measured by the DB meter and those calculated here.
-parser.add_argument("--db_offset", type=float, default=85, help="dBFS offset to add to all detected events' dBFS")
+parser.add_argument("--default_db_offset", type=float, default=85, 
+                    help="Default dBFS offset to add to all detected events' dBFS, if unable to be inferred from the audio type")
 parser.add_argument("--loud_db_offset", type=float, default=8.0, help="dB offset above average event dBFS to consider an event 'loud'")
+parser.add_argument("--search_peak_window_sec", type=float, default=0.2, 
+                    help="Window length in seconds to search for peak dBFS within an event span (set to -1 to disable)")
 parser.add_argument("--abs_time", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to print absolute time for timestamps")
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 
 def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
                          input_file: str, segment_seconds: float, sample_rate: int, 
-                         weak_thres_discount: float, db_offset: float, loud_db_offset: float, 
+                         weak_thres_discount: float, default_db_offset: float, loud_db_offset: float, 
                          desc2det_thres: Dict[str, float], desc2db_thres: Dict[str, float],
+                         search_peak_window_sec: float,
                          device: str, print_abs_time: bool, debug: bool):
     """
     Analyze audio file for specific event labels and print detected events with timestamps.
     """
     # Define audio file and event descriptions
     input_trunk = input_file.rsplit(".", 1)[0]
-    if print_abs_time:
-        # Try to extract start time from filename
-        m1 = PATTERN1.search(input_file)
-        m2 = PATTERN2.search(input_file)
-        if m1:
-            start_date = m1.group("date")
-            start_time = m1.group("start")
-            # 10262025
-            month, day, year = int(start_date[0:2]), int(start_date[2:4]), int(start_date[4:8])
-            hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
-            start_date_obj = datetime(year, month, day, hr, minute, second)
-        elif m2:
-            start_date = m2.group("date")
-            start_time = m2.group("start")
-            # 20251026
-            year, month, day = int(start_date[0:4]), int(start_date[4:6]), int(start_date[6:8])
-            hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
-            start_date_obj = datetime(year, month, day, hr, minute, second)
-        else:
-            print(f"Warning: Could not extract start time from filename {os.path.basename(input_file)}. Output relative time instead.")
-            print_abs_time = False
-            start_date_obj = None
+    # Try to extract start time from filename
+    m1 = PATTERN1.search(input_file) # Reolink camera recordings.
+    m2 = PATTERN2.search(input_file) # Manually recorded videos by phones.
+    if m1:
+        start_date = m1.group("date")
+        start_time = m1.group("start")
+        # 10262025
+        month, day, year = int(start_date[0:2]), int(start_date[2:4]), int(start_date[4:8])
+        hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
+        start_date_obj = datetime(year, month, day, hr, minute, second)
+        # dB offset for Reolink cameras, calibrated against DB meter readings.
+        db_offset = 85
+    elif m2:
+        start_date = m2.group("date")
+        start_time = m2.group("start")
+        # 20251026
+        year, month, day = int(start_date[0:4]), int(start_date[4:6]), int(start_date[6:8])
+        hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
+        start_date_obj = datetime(year, month, day, hr, minute, second)
+        # db offset for phone recordings, calibrated against DB meter readings.
+        # Phones have less sensitive microphones, so we use a higher dB offset.
+        db_offset = 95
     else:
+        print(f"Warning: Could not extract start time from filename {os.path.basename(input_file)}. Output relative time instead.")
+        print_abs_time = False
+        start_date_obj = None
+        db_offset = default_db_offset
+
+    if not print_abs_time:
         start_date_obj = None
 
     # If MP4, extract to WAV once
@@ -359,12 +427,17 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
         dynamic_ncols=True,
     )
 
+    wav_demeaned = wav - wav.mean()
+    chunks_demeaned, valid_lens_demeaned = zip(*list(split_waveform(wav_demeaned, seg_samples)))
+
     t0 = 0
     desc2intervals = {desc: [] for desc in desc2det_thres.keys()}
     event_db_mask = torch.zeros(total_samples, dtype=float).to(device)
 
     for chunk, valid_len in pbar:
         chunk_rs = F.resample(chunk, orig_freq=sr, new_freq=sample_rate)
+        chunk_demeaned = chunks_demeaned[pbar.n]
+        
         # Process inputs
         inputs = transform(audio=[chunk_rs], text=list(desc2det_thres.keys()), sampling_rate=sample_rate).to(device)
         # inputs.input_values have been normalized to [-1.02, 1.02] in the transform.
@@ -397,8 +470,10 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     global_end_s   = end_s   + t0
                     global_end     = int(global_end_s * sr)
                     # Take the span from the original chunk (not resampled).
-                    span_sound = chunk[:, start:end]
-                    dbfs = calc_dbfs(span_sound, db_offset)
+                    span_sound = chunk_demeaned[:, start:end]
+                    dbfs, dbfs_peak = calc_dbfs(span_sound, db_offset, search_peak_window_len=search_peak_window_sec * sr)
+                    # Use peak dBFS as the event's dBFS.
+                    dbfs = dbfs_peak  
                     # Ignore events below their dBFS thresholds.
                     # If in debug mode, keep all events for analysis.
                     if (not debug) and (dbfs < desc2db_thres[description]):
@@ -412,9 +487,18 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     all_events = {}
 
     for description in desc2det_thres.keys():
-        spans = merge_intervals(desc2intervals[description], tolerance=2)
+        # Merge the same type of events, if their time gap <= 2 seconds, and the dBFS difference <= 3.0 dB.
+        num_merges = 0
+        while True:
+            spans = merge_intervals(desc2intervals[description], time_tolerance=2, db_max_gap=3.0)
+            num_merges += 1
+            desc2intervals[description] = spans
+            if len(spans) == len(desc2intervals[description]):
+                # No more merges
+                break
+
         if spans:
-            span_strs = []
+            span_stats = []
             for start, end, (prob_mean, prob_max), dbfs in spans:
                 # Filter weak events below threshold.
                 if prob_max < desc2det_thres[description]:
@@ -426,28 +510,37 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                 end_min   = end   // 60
                 end_sec   = end   %  60
 
-                if debug:
-                    span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{prob_max:.2f}/{prob_mean:.2f}/{dbfs:.1f}db"))
-                else:
-                    span_strs.append((f"{start_min:02d}:{start_sec:02d}", f"{end_min:02d}:{end_sec:02d}", f"{dbfs:.1f}db"))
+                span_stat = SpanStat(
+                    start=f"{start_min:02d}:{start_sec:02d}",
+                    end=f"{end_min:02d}:{end_sec:02d}",
+                    dbfs=dbfs,
+                    prob_mean=prob_mean,
+                    prob_max=prob_max,
+                )
+                span_stats.append(span_stat)
 
-            all_events[description] = span_strs
-
+            all_events[description] = span_stats
             #span_str = ", ".join(span_strs)
             #print(f'"{description}": [{span_str}]')
         #else:
         #    print(f'"{description}": No events detected')
 
-    print_overlap_timeline(all_events, start_date_obj=start_date_obj, 
-                           tolerance_sec=4, debug=debug)
-    wav = wav.to(device)
-    avg_dbfs = calc_dbfs(wav, db_offset)
+    if len(all_events) == 0:
+        print("No events detected in the audio.")
+        return
+    
+    # merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
+    # Otherwise, the overlap timeline merging algorithm may discard some overlapped events.
+    merge_events_along_timeline(all_events, start_date_obj=start_date_obj, 
+                                time_tolerance=2, db_max_gap=3.0, debug=debug)
+    wav_demeaned = wav_demeaned.to(device)
+    avg_dbfs = calc_dbfs(wav_demeaned, db_offset, search_peak_window_len=-1)
     print(f"Average Audio dBFS: {avg_dbfs:.1f}db")
     if event_db_mask.sum() == 0:
         print("No events detected, skipping event dBFS analysis.")
         return
     nonevent_mask = (event_db_mask == 0)
-    all_nonevent_dbfs = extract_event_segments_from_mask(wav, nonevent_mask, sr, db_offset)
+    all_nonevent_dbfs = extract_event_segments_from_mask(wav_demeaned, nonevent_mask, sr, db_offset)
     avg_nonevent_dbfs = sum(dbfs * dur for dbfs, dur in all_nonevent_dbfs) / sum(dur for _, dur in all_nonevent_dbfs)
     print(f"Average Non-Event dBFS: {avg_nonevent_dbfs:.1f}db")
 
@@ -480,11 +573,11 @@ if __name__ == "__main__":
 
     desc2det_thres = {
         "open and close closet": 0.55,
+        "door creak or squeak": 0.55,
         "door slam": 0.65,
         "chopstick clatter": 0.5,
         "ceramic dish clatter": 0.5,
-        "kitchen clatter": 0.5,
-        "cutlery clinking": 0.5,
+        "kitchen clatter and clank": 0.5,
         "thud or thump": 0.6,
         "clack and clunk": 0.6,
         "chopping or cutting": 0.4,
@@ -496,11 +589,11 @@ if __name__ == "__main__":
 
     desc2db_thres = {
         "open and close closet": 55,
+        "door creak or squeak": 55,
         "door slam": 55,
         "chopstick clatter": 55,
         "ceramic dish clatter": 55,
-        "kitchen clatter": 55,
-        "cutlery clinking": 55,
+        "kitchen clatter and clank": 55,
         "thud or thump": 55,
         "clack and clunk": 55,
         "chopping or cutting": 55,
@@ -519,10 +612,11 @@ if __name__ == "__main__":
         segment_seconds=args.segment_seconds,
         sample_rate=args.sample_rate,
         weak_thres_discount=args.weak_thres_discount,
-        db_offset=args.db_offset,
+        default_db_offset=args.default_db_offset,
         loud_db_offset=args.loud_db_offset,
         desc2det_thres=desc2det_thres,
         desc2db_thres=desc2db_thres,
+        search_peak_window_sec=args.search_peak_window_sec,
         device=device,
         print_abs_time=args.abs_time,
         debug=args.debug,
