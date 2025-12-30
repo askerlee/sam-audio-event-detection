@@ -599,11 +599,14 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
 if __name__ == "__main__":
     args = parser.parse_args()
     device = "cuda"
-    # Load model and transform
+    # Load the model and transform.
+    # The 'large' model takes 30GB GPU memory for inference with batch size 1.
+    # It takes 40 minutes to process all 167 reolink recordings on a single NVIDIA RTX 6000 Ada GPU.
+    # The 'large' model is recommended for best accuracy.
     model = PEAudioFrame.from_config(f"pe-a-frame-{args.model_size}", pretrained=True).to(device)
     transform = PEAudioFrameTransform.from_config(f"pe-a-frame-{args.model_size}")
 
-    # Patch the forward method to include span detection
+    # Patch the forward method to return span probabilities.
     model.forward = PEAudioFrame_forward.__get__(model, PEAudioFrame)
 
     # Threshold for detection confidence per description
