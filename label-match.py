@@ -13,6 +13,7 @@ from typing import Iterable, List, Tuple, Dict, Union, Optional
 from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
 import json
+from pathlib import Path
 
 Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob_mean, prob_max), dbfs
 # start, end, "prob_max/prob_mean/dbfs"
@@ -345,7 +346,8 @@ def str2bool(v):
 # -------------------- args --------------------
 parser = argparse.ArgumentParser(description="Audio Source Separation using SAM-Audio (chunked + tqdm)")
 parser.add_argument("--model_size", type=str, default="large", choices=["small", "medium", "large"], help="Model size to use")
-parser.add_argument("--input_file", type=str, required=True, help="Path to the input audio file (.wav/.mp4/...)")
+parser.add_argument("--input_folder", type=str, default=None, help="Path to the input folder containing audio files")
+parser.add_argument("--input_file", type=str, default=None, help="Path to the input audio file (.wav/.mp4/...)")
 parser.add_argument("--segment_seconds", type=float, default=120.0, help="Chunk length in seconds (e.g. 5, 10, 30)")
 parser.add_argument("--max_segments", type=int, default=0, help="Maximum number of segments to process (0 = all)")
 parser.add_argument("--sample_rate", type=int, default=48000, help="Target sample rate for event detection")
@@ -533,7 +535,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
 
     if len(all_events) == 0:
         print("No events detected in the audio.")
-        return {}
+        return {}, None
     
     # merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
     # Otherwise, the overlap timeline merging algorithm may discard some overlapped events.
@@ -544,28 +546,31 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     print(f"Average Audio dBFS: {avg_dbfs:.1f}db")
     if event_db_mask.sum() == 0:
         print("No events detected, skipping event dBFS analysis.")
-        return
+        return {}, None
+    
     nonevent_mask = (event_db_mask == 0)
     all_nonevent_dbfs = extract_event_segments_from_mask(wav_demeaned, nonevent_mask, sr, db_offset)
     avg_nonevent_dbfs = sum(dbfs * dur for dbfs, dur in all_nonevent_dbfs) / sum(dur for _, dur in all_nonevent_dbfs)
     print(f"Average Non-Event dBFS: {avg_nonevent_dbfs:.1f}db")
 
+    '''
     event_db_mask_s = torch.nn.functional.interpolate(
         event_db_mask.unsqueeze(0).unsqueeze(0), 
         scale_factor=1.0/sr,
         mode='linear',
     ).squeeze()
     # breakpoint()
+    '''
 
     avg_event_dbfs = event_db_mask[event_db_mask > 0].mean().item()
     print(f"Average Event dBFS: {avg_event_dbfs:.1f}db")
     print(f"Duration of All Events:                  {(event_db_mask > 0).sum().item() / sr:.1f} seconds")
     if (event_db_mask > avg_nonevent_dbfs + loud_db_offset).sum() == 0:
         print(f"No loud events (> avg + {loud_db_offset}dB) detected.")
-        return
-    print(f"Duration of Loud Events (> avg + {loud_db_offset}dB): {(event_db_mask > avg_nonevent_dbfs + loud_db_offset).sum().item() / sr:.1f} seconds")
-    avg_loud_dbfs = event_db_mask[event_db_mask > avg_nonevent_dbfs + loud_db_offset].mean().item()
-    print(f"Avg dBFS of Loud Events: {avg_loud_dbfs:.1f}db = Average + {avg_loud_dbfs - avg_nonevent_dbfs:.1f}db")
+    else:
+        print(f"Duration of Loud Events (> avg + {loud_db_offset}dB): {(event_db_mask > avg_nonevent_dbfs + loud_db_offset).sum().item() / sr:.1f} seconds")
+        avg_loud_dbfs = event_db_mask[event_db_mask > avg_nonevent_dbfs + loud_db_offset].mean().item()
+        print(f"Avg dBFS of Loud Events: {avg_loud_dbfs:.1f}db = Average + {avg_loud_dbfs - avg_nonevent_dbfs:.1f}db")
 
     if start_date_obj:
         # Adjust all_events to absolute time
@@ -589,8 +594,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     prob_mean=span_stat.prob_mean,
                     prob_max=span_stat.prob_max,
                 )
-                
-    return all_events
+    return all_events, start_date_obj
     
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -638,49 +642,74 @@ if __name__ == "__main__":
         "plastic bag rustle": 50,
     }
 
-    all_events = \
-        analyze_audio_labels(
-            model=model,
-            transform=transform,
-            input_file=args.input_file,
-            segment_seconds=args.segment_seconds,
-            sample_rate=args.sample_rate,
-            weak_thres_discount=args.weak_thres_discount,
-            default_db_offset=args.default_db_offset,
-            loud_db_offset=args.loud_db_offset,
-            desc2det_thres=desc2det_thres,
-            desc2db_thres=desc2db_thres,
-            search_peak_window_sec=args.search_peak_window_sec,
-            device=device,
-            print_abs_time=args.abs_time,
-            debug=args.debug,
-        )
+    input_files = []
+    if args.input_folder:
+        # Process all mp4 files in the input folder
+        output_dir = args.input_folder
+        root = Path(args.input_folder)
+        files = sorted(root.rglob("*.mp4"))
+        for input_file in files:
+            # Only include files in subfolders, which are reolink recordings.
+            # Skip files directly under root folder, which are manually recorded videos (for calibration only).
+            if input_file.parent != root:
+                input_files.append(str(input_file))
 
-    if args.output_clef and all_events:
-        # Output CLEF-format results for Seq visualization
-        output_file = args.input_file.rsplit(".", 1)[0] + "_clef_events.txt"
-        with open(output_file, "w") as f:
-            for label, spans in all_events.items():
-                for span_stat in spans:
-                    # {"@t":"1970-01-01T00:00:01+08:00","@st":"1970-01-01T00:00:00+08:00",
-                    # "@tr":"00000000000000000000000000000001","@sp":"0000000000000001",
-                    # "@l":"Information","@mt":"Detected {Event} ({Prob1}/{Prob2}/{Db} dB)",
-                    # "Event":"chopstick clatter","Prob1":0.55,"Prob2":0.45,"Db":58.6,
-                    # "SegmentStart":"00:00","SegmentEnd":"00:00"}
-                    f.write(json.dumps({
-                        "@t": span_stat.end + "+08:00",
-                        "@st": span_stat.start + "+08:00",
-                        "@tr": "0" * 31 + "1",  # using an arbitrary 32-bit trace ID
-                        "@sp": "0" * 15 + "1",  # using an arbitrary 16-bit span ID
-                        "@l": "Information",
-                        "@mt": "Detected {Event} ({Prob1}/{Prob2}/{Db} dB)",    # template for Seq to understand
-                        "Event": label,
-                        "Prob1": round(span_stat.prob_max, 3),
-                        "Prob2": round(span_stat.prob_mean, 3),
-                        "Db": round(span_stat.dbfs, 1),
-                        "SegmentStart": span_stat.start[-5:],
-                        "SegmentEnd": span_stat.end[-5:],
-                    }) + "\n")
+    elif args.input_file:
+        output_dir = os.path.dirname(args.input_file)
+        input_files.append(args.input_file)
+    else:
+        print("Error: Please provide either --input_folder or --input_file.")
+        exit(1)
 
-        print(f"CLEF-format results written to {output_file}")
+    for input_file in input_files:
+        print(f"\nAnalyzing audio file: {input_file}")
+         # Analyze audio labels
+        all_events, start_date_obj = \
+            analyze_audio_labels(
+                model=model,
+                transform=transform,
+                input_file=input_file,
+                segment_seconds=args.segment_seconds,
+                sample_rate=args.sample_rate,
+                weak_thres_discount=args.weak_thres_discount,
+                default_db_offset=args.default_db_offset,
+                loud_db_offset=args.loud_db_offset,
+                desc2det_thres=desc2det_thres,
+                desc2db_thres=desc2db_thres,
+                search_peak_window_sec=args.search_peak_window_sec,
+                device=device,
+                print_abs_time=args.abs_time,
+                debug=args.debug,
+            )
+
+        if args.output_clef and all_events:
+            # Output CLEF-format results for Seq visualization
+            output_file = start_date_obj.strftime("%Y%m%d_%H%M%S_events.clef") if start_date_obj else \
+                          os.path.basename(input_file).rsplit(".", 1)[0] + "_events.clef"
+            output_file = os.path.join(output_dir, output_file)
+
+            with open(output_file, "w") as f:
+                for label, spans in all_events.items():
+                    for span_stat in spans:
+                        # {"@t":"1970-01-01T00:00:01+08:00","@st":"1970-01-01T00:00:00+08:00",
+                        # "@tr":"00000000000000000000000000000001","@sp":"0000000000000001",
+                        # "@l":"Information","@mt":"Detected {Event} ({Prob1}/{Prob2}/{Db} dB)",
+                        # "Event":"chopstick clatter","Prob1":0.55,"Prob2":0.45,"Db":58.6,
+                        # "SegmentStart":"00:00","SegmentEnd":"00:00"}
+                        f.write(json.dumps({
+                            "@t": span_stat.end + "+08:00",
+                            "@st": span_stat.start + "+08:00",
+                            "@tr": "0" * 31 + "1",  # using an arbitrary 32-bit trace ID
+                            "@sp": "0" * 15 + "1",  # using an arbitrary 16-bit span ID
+                            "@l": "Information",
+                            "@mt": "Detected {Event} ({Prob1}/{Prob2}/{Db} dB)",    # template for Seq to understand
+                            "Event": label,
+                            "Prob1": round(span_stat.prob_max, 3),
+                            "Prob2": round(span_stat.prob_mean, 3),
+                            "Db": round(span_stat.dbfs, 1),
+                            "SegmentStart": span_stat.start[-5:],
+                            "SegmentEnd": span_stat.end[-5:],
+                        }) + "\n")
+
+            print(f"CLEF-format results written to {output_file}")
 
