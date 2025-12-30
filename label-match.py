@@ -12,6 +12,7 @@ from tqdm import tqdm
 from typing import Iterable, List, Tuple, Dict, Union, Optional
 from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
+import json
 
 Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob_mean, prob_max), dbfs
 # start, end, "prob_max/prob_mean/dbfs"
@@ -20,6 +21,8 @@ Interval = Tuple[float, float, Tuple[float, float], float]   # start, end, (prob
 Interval_str = Tuple[str, str, str]
 # label -> "No events detected" or list of Interval_strs
 Events = Dict[str, Union[str, List[Interval_str]]]
+# start, end: string "MM:SS" or "%Y-%m-%dT%H:%M:%S" (clef-format output). 
+# dbfs, prob_mean, prob_max: float.
 SpanStat = namedtuple("SpanStat", ["start", "end", "dbfs", "prob_mean", "prob_max"])
 # Reolink camera recordings.
 PATTERN1 = re.compile(r"(?P<date>\d{8})[/\\](?P<prefix>.+)-(?P<start>\d{6})-(?P<end>\d{6})\.(mp4|wav)$", re.IGNORECASE)
@@ -102,7 +105,7 @@ def extract_event_segments_from_mask(audio: torch.Tensor, mask: torch.Tensor, sa
     
     return segments
 
-def merge_events_along_timeline(events: Events, start_date_obj: Optional[datetime] = None, 
+def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[datetime] = None, 
                                 time_tolerance: int = 0, db_max_gap: float = 0.0,
                                 debug=False) -> None:
     """
@@ -120,8 +123,8 @@ def merge_events_along_timeline(events: Events, start_date_obj: Optional[datetim
     seconds_are_labels_in_extended_regions = defaultdict(dict) # second -> dict(label: bool)
 
     # 1) paint timeline per second (inclusive endpoints)
-    for label, spans in events.items():
-        if not spans or isinstance(spans, str):  # e.g. "No events detected"
+    for label, spans in all_events.items():
+        if not spans:
             continue
         for span_stat in spans:
             a, b = span_stat.start, span_stat.end
@@ -356,6 +359,8 @@ parser.add_argument("--search_peak_window_sec", type=float, default=0.2,
                     help="Window length in seconds to search for peak dBFS within an event span (set to -1 to disable)")
 parser.add_argument("--abs_time", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to print absolute time for timestamps")
+parser.add_argument("--output_clef", type=str2bool, nargs='?', const=True, default=False, 
+                    help="Whether to output CLEF-format results for Seq visualization")
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 
 def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
@@ -396,9 +401,6 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
         print_abs_time = False
         start_date_obj = None
         db_offset = default_db_offset
-
-    if not print_abs_time:
-        start_date_obj = None
 
     # If MP4, extract to WAV once
     if input_file.lower().endswith(".mp4"):
@@ -476,9 +478,9 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     # Take the span from the original chunk (not resampled).
                     span_sound = chunk_demeaned[:, start:end]
                     dbfs, dbfs_peak = calc_dbfs(span_sound, db_offset, search_peak_window_len=search_peak_window_sec * sr)
-                    # The loudest part usually determines how disturbing the event is. 
-                    # Also the loudest part will retain in memory for a short while 
-                    # (usually long enough to last through the whole span, and sometimes longer).
+                    # NOTE: The loudest part usually determines how disturbing the event is. 
+                    # Also the loudest part will linger in attention for a short while 
+                    # (usually long enough to last through the whole span, and only fades out till much later).
                     # Therefore, we use peak dBFS as the event's dBFS, 
                     # to better reflect the actual psychological effect of the noise.
                     dbfs = dbfs_peak
@@ -528,18 +530,14 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                 span_stats.append(span_stat)
 
             all_events[description] = span_stats
-            #span_str = ", ".join(span_strs)
-            #print(f'"{description}": [{span_str}]')
-        #else:
-        #    print(f'"{description}": No events detected')
 
     if len(all_events) == 0:
         print("No events detected in the audio.")
-        return
+        return {}
     
     # merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
     # Otherwise, the overlap timeline merging algorithm may discard some overlapped events.
-    merge_events_along_timeline(all_events, start_date_obj=start_date_obj, 
+    merge_events_along_timeline(all_events, start_date_obj=start_date_obj if print_abs_time else None,
                                 time_tolerance=2, db_max_gap=3.0, debug=debug)
     wav_demeaned = wav_demeaned.to(device)
     avg_dbfs = calc_dbfs(wav_demeaned, db_offset, search_peak_window_len=-1)
@@ -569,6 +567,31 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     avg_loud_dbfs = event_db_mask[event_db_mask > avg_nonevent_dbfs + loud_db_offset].mean().item()
     print(f"Avg dBFS of Loud Events: {avg_loud_dbfs:.1f}db = Average + {avg_loud_dbfs - avg_nonevent_dbfs:.1f}db")
 
+    if start_date_obj:
+        # Adjust all_events to absolute time
+        # all_events: label -> list of SpanStat
+        for label, spans in all_events.items():
+            if not spans:
+                continue
+            for i in range(len(spans)):
+                span_stat = spans[i]
+                s_sec = mmss_to_sec(span_stat.start)
+                e_sec = mmss_to_sec(span_stat.end)
+                s_dt = start_date_obj + timedelta(seconds=s_sec)
+                # The detected end time is inclusive. Seq visualization calculates span length as (end - start).
+                # So we add 1 second to make the calculated span length correct.
+                e_dt = start_date_obj + timedelta(seconds=e_sec + 1)
+                # Extend start and end to absolute time format.
+                spans[i] = SpanStat(
+                    start=s_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    end=e_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    dbfs=span_stat.dbfs,
+                    prob_mean=span_stat.prob_mean,
+                    prob_max=span_stat.prob_max,
+                )
+                
+    return all_events
+    
 if __name__ == "__main__":
     args = parser.parse_args()
     device = "cuda"
@@ -615,20 +638,49 @@ if __name__ == "__main__":
         "plastic bag rustle": 50,
     }
 
-    analyze_audio_labels(
-        model=model,
-        transform=transform,
-        input_file=args.input_file,
-        segment_seconds=args.segment_seconds,
-        sample_rate=args.sample_rate,
-        weak_thres_discount=args.weak_thres_discount,
-        default_db_offset=args.default_db_offset,
-        loud_db_offset=args.loud_db_offset,
-        desc2det_thres=desc2det_thres,
-        desc2db_thres=desc2db_thres,
-        search_peak_window_sec=args.search_peak_window_sec,
-        device=device,
-        print_abs_time=args.abs_time,
-        debug=args.debug,
-    )
-    
+    all_events = \
+        analyze_audio_labels(
+            model=model,
+            transform=transform,
+            input_file=args.input_file,
+            segment_seconds=args.segment_seconds,
+            sample_rate=args.sample_rate,
+            weak_thres_discount=args.weak_thres_discount,
+            default_db_offset=args.default_db_offset,
+            loud_db_offset=args.loud_db_offset,
+            desc2det_thres=desc2det_thres,
+            desc2db_thres=desc2db_thres,
+            search_peak_window_sec=args.search_peak_window_sec,
+            device=device,
+            print_abs_time=args.abs_time,
+            debug=args.debug,
+        )
+
+    if args.output_clef and all_events:
+        # Output CLEF-format results for Seq visualization
+        output_file = args.input_file.rsplit(".", 1)[0] + "_clef_events.txt"
+        with open(output_file, "w") as f:
+            for label, spans in all_events.items():
+                for span_stat in spans:
+                    # {"@t":"1970-01-01T00:00:01+08:00","@st":"1970-01-01T00:00:00+08:00",
+                    # "@tr":"00000000000000000000000000000001","@sp":"0000000000000001",
+                    # "@l":"Information","@mt":"Detected {Event} ({Prob1}/{Prob2}/{Db} dB)",
+                    # "Event":"chopstick clatter","Prob1":0.55,"Prob2":0.45,"Db":58.6,
+                    # "SegmentStart":"00:00","SegmentEnd":"00:00"}
+                    f.write(json.dumps({
+                        "@t": span_stat.end + "+08:00",
+                        "@st": span_stat.start + "+08:00",
+                        "@tr": "0" * 31 + "1",  # using an arbitrary 32-bit trace ID
+                        "@sp": "0" * 15 + "1",  # using an arbitrary 16-bit span ID
+                        "@l": "Information",
+                        "@mt": "Detected {Event} ({Prob1}/{Prob2}/{Db} dB)",    # template for Seq to understand
+                        "Event": label,
+                        "Prob1": round(span_stat.prob_max, 3),
+                        "Prob2": round(span_stat.prob_mean, 3),
+                        "Db": round(span_stat.dbfs, 1),
+                        "SegmentStart": span_stat.start[-5:],
+                        "SegmentEnd": span_stat.end[-5:],
+                    }) + "\n")
+
+        print(f"CLEF-format results written to {output_file}")
+
