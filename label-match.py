@@ -535,7 +535,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
 
     if len(all_events) == 0:
         print("No events detected in the audio.")
-        return {}, None
+        return {}, None, 0
     
     # merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
     # Otherwise, the overlap timeline merging algorithm may discard some overlapped events.
@@ -546,7 +546,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     print(f"Average Audio dBFS: {avg_dbfs:.1f}db")
     if event_db_mask.sum() == 0:
         print("No events detected, skipping event dBFS analysis.")
-        return {}, None
+        return {}, None, 0
     
     nonevent_mask = (event_db_mask == 0)
     all_nonevent_dbfs = extract_event_segments_from_mask(wav_demeaned, nonevent_mask, sr, db_offset)
@@ -594,7 +594,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     prob_mean=span_stat.prob_mean,
                     prob_max=span_stat.prob_max,
                 )
-    return all_events, start_date_obj
+    return all_events, start_date_obj, avg_nonevent_dbfs
     
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -661,10 +661,10 @@ if __name__ == "__main__":
         print("Error: Please provide either --input_folder or --input_file.")
         exit(1)
 
-    for input_file in input_files:
+    for input_file in tqdm(input_files):
         print(f"\nAnalyzing audio file: {input_file}")
          # Analyze audio labels
-        all_events, start_date_obj = \
+        all_events, start_date_obj, avg_nonevent_dbfs = \
             analyze_audio_labels(
                 model=model,
                 transform=transform,
@@ -702,11 +702,12 @@ if __name__ == "__main__":
                             "@tr": "0" * 31 + "1",  # using an arbitrary 32-bit trace ID
                             "@sp": "0" * 15 + "1",  # using an arbitrary 16-bit span ID
                             "@l": "Information",
-                            "@mt": "Detected {Event} ({Prob1}/{Prob2}/{Db} dB)",    # template for Seq to understand
+                            "@mt": "Detected {Event} ({Prob1}/{Prob2}/{Db}/{DbDelta} dB)",    # template for Seq to understand
                             "Event": label,
                             "Prob1": round(span_stat.prob_max, 3),
                             "Prob2": round(span_stat.prob_mean, 3),
                             "Db": round(span_stat.dbfs, 1),
+                            "DbDelta": round(span_stat.dbfs - avg_nonevent_dbfs, 1),
                             "SegmentStart": span_stat.start[-5:],
                             "SegmentEnd": span_stat.end[-5:],
                         }) + "\n")
