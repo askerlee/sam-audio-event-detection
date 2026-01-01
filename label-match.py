@@ -34,6 +34,70 @@ PATTERN2 = re.compile(r"(?P<prefix>.+)_(?P<date>\d{8})_(?P<start>\d{6})\.(mp4|wa
 # The latter are actually PATTERN2 recordings renamed to this format for CDRT submission.
 PATTERN3 = re.compile(r"＜(?P<date>\d{2} \w+ \d{4})＞-＜(?P<start>\d{2}-\d{2}-\d{2})＞-＜(?P<desc>.+)＞\.(mp4|wav)$", re.IGNORECASE)
 
+def parse_input_filename(input_filepath: str, output_cdrt_transcripts: bool, 
+                         dvd_label_mapping: Optional[Dict[str, str]], default_db_offset: float):
+    # Define audio file and event descriptions for CDRT transcripts.
+    dvd_label, file_trunk = None, None
+    is_meter_video = False
+    # Try to extract start time from filename
+    m1 = PATTERN1.search(input_filepath) # Reolink camera recordings.
+    m2 = PATTERN2.search(input_filepath) # Manually recorded videos by phones.
+    m3 = PATTERN3.search(input_filepath) # CDRT submissions.
+    if m1:
+        start_date = m1.group("date")
+        start_time = m1.group("start")
+        # 10262025
+        month, day, year = int(start_date[0:2]), int(start_date[2:4]), int(start_date[4:8])
+        hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
+        start_date_obj = datetime(year, month, day, hr, minute, second)
+        # dB offset for Reolink cameras, calibrated against DB meter readings.
+        db_offset = 85
+    elif m2:
+        start_date = m2.group("date")
+        start_time = m2.group("start")
+        # 20251026
+        year, month, day = int(start_date[0:4]), int(start_date[4:6]), int(start_date[6:8])
+        hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
+        start_date_obj = datetime(year, month, day, hr, minute, second)
+        # db offset for phone recordings, calibrated against DB meter readings.
+        # Phones have less sensitive microphones, so we use a higher dB offset.
+        db_offset = 95
+        is_meter_video = True
+    elif m3:
+        start_date = m3.group("date")
+        start_time = m3.group("start")
+        # date: "08 August 2025"
+        date_obj = datetime.strptime(start_date, "%d %B %Y")
+        year, month, day = date_obj.year, date_obj.month, date_obj.day
+        hr, minute, second = map(int, start_time.split("-"))
+        start_date_obj = datetime(year, month, day, hr, minute, second)
+        if m3.group("desc").lower() == "kitchen noises":
+            # db offset for phone recordings without sound level meter app, calibrated against DB meter readings.
+            db_offset = 85
+        elif m3.group("desc").lower() == "kitchen noises (sound level meter)":
+            # db offset for phone recordings with sound level meter app, calibrated against DB meter readings.
+            db_offset = 95
+            is_meter_video = True
+        else:
+            db_offset = default_db_offset
+            breakpoint() # SHouldn't reach here.
+
+        if output_cdrt_transcripts:
+            parent_dir = Path(input_filepath).parent
+            file_trunk = Path(input_filepath).stem
+            dvd_label = dvd_label_mapping[parent_dir.name]
+    else:
+        print(f"Warning: Could not extract start time from filename {os.path.basename(input_filepath)}.")
+        start_date_obj = None
+        db_offset = default_db_offset
+
+    return start_date_obj, db_offset, dvd_label, file_trunk, is_meter_video
+
+def extract_datetime_from_filepath(input_filepath: str):
+    start_date_obj, db_offset, dvd_label, file_trunk, is_meter_video = parse_input_filename(
+        input_filepath, False, None, 85.0)
+    return start_date_obj
+
 # For phones with stereo recording, convert to mono using mid-side technique.
 def stereo_to_mono(wav: torch.Tensor) -> torch.Tensor:
     L, R = wav[0], wav[1]
@@ -387,7 +451,7 @@ parser.add_argument("--db_max_gap", type=float, default=5.0,
                     help="Max dBFS gap to merge same event types along timeline")
 parser.add_argument("--abs_time", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to print absolute time for timestamps")
-parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output results")
+parser.add_argument("--output_folder", type=str, default=".", help="Directory to save output results")
 parser.add_argument("--output_clef", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to output CLEF-format results for Seq visualization")
 parser.add_argument("--output_cdrt_transcripts", type=str2bool, nargs='?', const=True, default=False, 
@@ -397,7 +461,7 @@ parser.add_argument("--dvd_label_mapping_file", type=str, default=None,
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 
 def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
-                         input_file: str, segment_seconds: float, sample_rate: int, 
+                         input_filepath: str, segment_seconds: float, sample_rate: int, 
                          weak_thres_discount: float, default_db_offset: float, loud_db_offset: float, 
                          desc2det_thres: Dict[str, float], desc2db_thres: Dict[str, float],
                          search_peak_window_sec: float,
@@ -414,62 +478,14 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     https://www.judiciary.gov.sg/civil/prepare-evidence-neighbour-dispute-claim
     """
 
-    # input_file is the full path (relative or absolute) to the audio file.
-    # Define audio file and event descriptions
-    dvd_label, file_trunk = None, None
-    is_meter_video = False
-    # Try to extract start time from filename
-    m1 = PATTERN1.search(input_file) # Reolink camera recordings.
-    m2 = PATTERN2.search(input_file) # Manually recorded videos by phones.
-    m3 = PATTERN3.search(input_file) # CDRT submissions.
-    if m1:
-        start_date = m1.group("date")
-        start_time = m1.group("start")
-        # 10262025
-        month, day, year = int(start_date[0:2]), int(start_date[2:4]), int(start_date[4:8])
-        hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
-        start_date_obj = datetime(year, month, day, hr, minute, second)
-        # dB offset for Reolink cameras, calibrated against DB meter readings.
-        db_offset = 85
-    elif m2:
-        start_date = m2.group("date")
-        start_time = m2.group("start")
-        # 20251026
-        year, month, day = int(start_date[0:4]), int(start_date[4:6]), int(start_date[6:8])
-        hr, minute, second = int(start_time[0:2]), int(start_time[2:4]), int(start_time[4:6])
-        start_date_obj = datetime(year, month, day, hr, minute, second)
-        # db offset for phone recordings, calibrated against DB meter readings.
-        # Phones have less sensitive microphones, so we use a higher dB offset.
-        db_offset = 95
-        is_meter_video = True
-    elif m3:
-        start_date = m3.group("date")
-        start_time = m3.group("start")
-        # date: "08 August 2025"
-        date_obj = datetime.strptime(start_date, "%d %B %Y")
-        year, month, day = date_obj.year, date_obj.month, date_obj.day
-        hr, minute, second = map(int, start_time.split("-"))
-        start_date_obj = datetime(year, month, day, hr, minute, second)
-        if m3.group("desc").lower() == "kitchen noises":
-            # db offset for phone recordings without sound level meter app, calibrated against DB meter readings.
-            db_offset = 85
-        elif m3.group("desc").lower() == "kitchen noises (sound level meter)":
-            # db offset for phone recordings with sound level meter app, calibrated against DB meter readings.
-            db_offset = 95
-            is_meter_video = True
-        else:
-            db_offset = default_db_offset
-            breakpoint() # SHouldn't reach here.
-
-        if output_cdrt_transcripts:
-            parent_dir = Path(input_file).parent
-            file_trunk = Path(input_file).stem
-            dvd_label = dvd_label_mapping[parent_dir.name]
-    else:
-        print(f"Warning: Could not extract start time from filename {os.path.basename(input_file)}. Output relative time instead.")
+    # input_filepath is the full path (relative or absolute) to the audio file.
+    start_date_obj, db_offset, dvd_label, file_trunk, is_meter_video = parse_input_filename(
+        input_filepath, output_cdrt_transcripts, dvd_label_mapping, default_db_offset)
+    
+    # If the start date and time is not extracted from filename, we cannot print absolute time.
+    if start_date_obj is None and print_abs_time:
+        print(f"Warning: Cannot print absolute time due to missing start time info in the file path.")
         print_abs_time = False
-        start_date_obj = None
-        db_offset = default_db_offset
 
     # -------------------- load + resample once --------------------
     # NOTE: here we directly load the mp4 file using torchaudio.load(), and get the audio track.
@@ -477,7 +493,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     # can load the audio track from an MP4.
     # If you only have the SoX backend, it generally won’t load MP4 
     # (SoX doesn’t handle MP4 containers by default).
-    wav, sr = torchaudio.load(input_file)  # wav: (channels, samples)
+    wav, sr = torchaudio.load(input_filepath)  # wav: (channels, samples)
     # Video/Audio recorded by phones.
     if wav.shape[0] == 2:
         wav = stereo_to_mono(wav)
@@ -486,7 +502,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     total_samples = wav.shape[1]
     num_segments = max(1, math.ceil(total_samples / seg_samples))
 
-    print(f"Loaded: {input_file} | sr={sr} | chunk={segment_seconds}s ({seg_samples} samples) | segments={num_segments}")
+    print(f"Loaded: {input_filepath} | sr={sr} | chunk={segment_seconds}s ({seg_samples} samples) | segments={num_segments}")
   
     # -------------------- process each description over chunks --------------------
     pbar = tqdm(
@@ -665,7 +681,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = "cuda"
 
-    input_files = []
+    input_filepaths = []
     if args.input_folders:
         # Process all mp4 files in the input folders
         for folder in args.input_folders:
@@ -673,15 +689,18 @@ if __name__ == "__main__":
             # Don't include .wav files, as they are converted from .mp4 files.
             # We don't count the .wav files to avoid duplicate processing.
             files = sorted(root.rglob("*.mp4"))
-            for input_file in files:
-                input_files.append(str(input_file))
+            for input_filepath in files:
+                input_filepaths.append(str(input_filepath))
 
     elif args.input_files:
-        input_files.extend(args.input_files)
+        input_filepaths.extend(args.input_files)
     else:
-        print("Error: Please provide either --input_folder or --input_file.")
+        print("Error: Please provide either --input_folders or --input_files.")
         exit(1)
 
+    # Sort input_filepaths by date/time info in filename
+    input_filepaths = sorted(input_filepaths, key=lambda x: extract_datetime_from_filepath(x) or datetime.max)
+    
     if args.output_cdrt_transcripts:
         if args.dvd_label_mapping_file is None:
             print("Error: Please provide --dvd_label_mapping_file when --output_cdrt_transcripts is set to True.")
@@ -700,7 +719,7 @@ if __name__ == "__main__":
                 folder_name, dvd_label = parts
                 dvd_label_mapping[folder_name] = dvd_label
         cdrt_transcript_header = "CD or DVD label,File name of recording,Time location within recording,Transcript"
-        CDRT_TRANSCRIPT = open(os.path.join(args.output_dir, "cdrt_transcripts.csv"), "w")
+        CDRT_TRANSCRIPT = open(os.path.join(args.output_folder, "cdrt_transcripts.csv"), "w")
     else:
         dvd_label_mapping = None
         CDRT_TRANSCRIPT   = None
@@ -751,14 +770,14 @@ if __name__ == "__main__":
         "plastic bag rustle": 50,
     }
 
-    for input_file in tqdm(input_files):
-        print(f"\nAnalyzing audio file: {input_file}")
+    for input_filepath in tqdm(input_filepaths):
+        print(f"\nAnalyzing audio file: {input_filepath}")
          # Analyze audio labels
         all_events, start_date_obj, avg_nonevent_dbfs, is_meter_video = \
             analyze_audio_labels(
                 model=model,
                 transform=transform,
-                input_file=input_file,
+                input_filepath=input_filepath,
                 segment_seconds=args.segment_seconds,
                 sample_rate=args.sample_rate,
                 weak_thres_discount=args.weak_thres_discount,
@@ -778,8 +797,10 @@ if __name__ == "__main__":
         if args.output_clef and all_events:
             # Output CLEF-format results for Seq visualization
             output_file = start_date_obj.strftime("%Y%m%d_%H%M%S_events.clef") if start_date_obj else \
-                          os.path.basename(input_file).rsplit(".", 1)[0] + "_events.clef"
-            output_file = os.path.join(args.output_dir, output_file)
+                          os.path.basename(input_filepath).rsplit(".", 1)[0] + "_events.clef"
+            clef_output_folder = os.path.join(args.output_folder, "clef")
+            os.makedirs(clef_output_folder, exist_ok=True)
+            output_file = os.path.join(clef_output_folder, output_file)
 
             with open(output_file, "w") as f:
                 for label, spans in all_events.items():
