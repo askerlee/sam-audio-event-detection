@@ -1,3 +1,4 @@
+from ast import If
 import torch
 import torchaudio
 import torchaudio.functional as F
@@ -7,9 +8,8 @@ import os
 import re
 import math
 import argparse
-from pydub import AudioSegment
 from tqdm import tqdm
-from typing import Iterable, List, Tuple, Dict, Union, Optional
+from typing import Iterable, List, Tuple, Dict, Union, Optional, TextIO
 from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
 import json
@@ -29,6 +29,10 @@ SpanStat = namedtuple("SpanStat", ["start", "end", "dbfs", "prob_mean", "prob_ma
 PATTERN1 = re.compile(r"(?P<date>\d{8})[/\\](?P<prefix>.+)-(?P<start>\d{6})-(?P<end>\d{6})\.(mp4|wav)$", re.IGNORECASE)
 # Manually recorded videos.
 PATTERN2 = re.compile(r"(?P<prefix>.+)_(?P<date>\d{8})_(?P<start>\d{6})\.(mp4|wav)$", re.IGNORECASE)
+# ＜08 August 2025＞-＜12-06-24＞-＜kitchen noises＞.mp4
+# desc is always either "kitchen noises" or "kitchen noises (sound level meter)".
+# The latter are actually PATTERN2 recordings renamed to this format for CDRT submission.
+PATTERN3 = re.compile(r"＜(?P<date>\d{2} \w+ \d{4})＞-＜(?P<start>\d{2}-\d{2}-\d{2})＞-＜(?P<desc>.+)＞\.(mp4|wav)$", re.IGNORECASE)
 
 # For phones with stereo recording, convert to mono using mid-side technique.
 def stereo_to_mono(wav: torch.Tensor) -> torch.Tensor:
@@ -108,6 +112,9 @@ def extract_event_segments_from_mask(audio: torch.Tensor, mask: torch.Tensor, sa
 
 def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[datetime] = None, 
                                 time_tolerance: int = 0, db_max_gap: float = 0.0,
+                                output_cdrt_transcripts: bool = False,
+                                dvd_label: Optional[str] = None, file_trunk: Optional[str] = None,
+                                cdrt_transcript_fh: Optional[TextIO] = None,
                                 debug=False) -> None:
     """
     Prints segments in time order.
@@ -122,6 +129,7 @@ def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[dat
     # seconds_painted_with_labels2: seconds_painted_with_labels extended with time tolerance at both ends.
     seconds_painted_with_labels2 = defaultdict(dict)  # second -> dict(label: prob)
     seconds_are_labels_in_extended_regions = defaultdict(dict) # second -> dict(label: bool)
+    file_trunk = file_trunk.replace("＜", "<").replace("＞", ">") if file_trunk else None
 
     # 1) paint timeline per second (inclusive endpoints)
     for label, spans in all_events.items():
@@ -133,7 +141,6 @@ def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[dat
             assert e >= s, f"Invalid interval: {a}-{b}"
             for t in range(s, e + 1):
                 seconds_painted_with_labels[t][label] = span_stat
-
 
             # Only add tolerance to the start time, not the end time, 
             # to avoid adding extra seconds to the end of each event.
@@ -172,6 +179,23 @@ def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[dat
                 print(f"{abs_time}/{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
             else:
                 print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
+
+            if output_cdrt_transcripts and cdrt_transcript_fh:
+                # We always output relative time, regardless of whether start_date_obj is given.
+                # Since csv uses "," as separator, we use "; " to separate multiple events.
+                # TODO: Not sure if we should output dbfs in the transcript. 
+                # The issue is, if we don't output dbfs, then multiple events of the same type
+                # that are split due to disparate dbfs values will appear as consecutive events of the same type
+                # without apparent distinction, which may look confusing to examiners.
+                # Example:
+                # 00:01:52 to 00:01:55,kitchen clatter and clank
+                # 00:01:56 to 00:01:57,kitchen clatter and clank
+                # If we output dbfs, then the two events will be:
+                # 00:01:52 to 00:01:55,kitchen clatter and clank (72.5db)
+                # 00:01:56 to 00:01:57,kitchen clatter and clank (60.0db)
+                # The examiner can then see the difference and may better understand why the events are split.
+                event_transcript = "; ".join(f"{label} ({span_stat.dbfs:.1f}db)" for label, span_stat in sorted(label2span_stat.items()))
+                cdrt_transcript_fh.write(f"{dvd_label},{file_trunk},00:{sec_to_mmss(seg_start)} to 00:{sec_to_mmss(seg_end)},{event_transcript}\n")
 
     for t in range(t0 + 1, t1 + 2):  # +2 to flush the last segment
         # Get labels from seconds_painted_with_labels2 (with time tolerance).
@@ -346,23 +370,30 @@ def str2bool(v):
 # -------------------- args --------------------
 parser = argparse.ArgumentParser(description="Audio Source Separation using SAM-Audio (chunked + tqdm)")
 parser.add_argument("--model_size", type=str, default="large", choices=["small", "medium", "large"], help="Model size to use")
-parser.add_argument("--input_folder", type=str, default=None, help="Path to the input folder containing audio files")
-parser.add_argument("--input_file", type=str, default=None, help="Path to the input audio file (.wav/.mp4/...)")
+parser.add_argument("--input_folders", type=str, nargs='*',
+                    default=None, help="Paths to the input folders containing audio files")
+parser.add_argument("--input_files", type=str, nargs='*', default=None, help="Paths to the input audio file (.wav/.mp4/...)")
 parser.add_argument("--segment_seconds", type=float, default=120.0, help="Chunk length in seconds (e.g. 5, 10, 30)")
-parser.add_argument("--max_segments", type=int, default=0, help="Maximum number of segments to process (0 = all)")
 parser.add_argument("--sample_rate", type=int, default=48000, help="Target sample rate for event detection")
 parser.add_argument("--weak_thres_discount", type=float, default=0.8, 
                     help="Discount factor for weak event detection threshold")
-# This offset has been calibrated by comparing dBFS values measured by the DB meter and those calculated here.
+# db_offset has been calibrated by comparing dBFS values measured by the DB meter and those calculated here.
 parser.add_argument("--default_db_offset", type=float, default=85, 
                     help="Default dBFS offset to add to all detected events' dBFS, if unable to be inferred from the audio type")
 parser.add_argument("--loud_db_offset", type=float, default=8.0, help="dB offset above average event dBFS to consider an event 'loud'")
 parser.add_argument("--search_peak_window_sec", type=float, default=0.2, 
                     help="Window length in seconds to search for peak dBFS within an event span (set to -1 to disable)")
+parser.add_argument("--db_max_gap", type=float, default=5.0,
+                    help="Max dBFS gap to merge same event types along timeline")
 parser.add_argument("--abs_time", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to print absolute time for timestamps")
+parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output results")
 parser.add_argument("--output_clef", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to output CLEF-format results for Seq visualization")
+parser.add_argument("--output_cdrt_transcripts", type=str2bool, nargs='?', const=True, default=False, 
+                    help="Whether to output CDRT-format transcripts for submission")
+parser.add_argument("--dvd_label_mapping_file", type=str, default=None,
+                    help="Path to DVD label mapping .txt file (if outputting CDRT-format transcripts)")
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 
 def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
@@ -370,15 +401,27 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                          weak_thres_discount: float, default_db_offset: float, loud_db_offset: float, 
                          desc2det_thres: Dict[str, float], desc2db_thres: Dict[str, float],
                          search_peak_window_sec: float,
-                         device: str, print_abs_time: bool, debug: bool):
+                         device: str, print_abs_time: bool, output_cdrt_transcripts: bool, 
+                         dvd_label_mapping: Optional[Dict[str, str]], 
+                         cdrt_transcript_fh: Optional[TextIO],
+                         debug: bool):
     """
     Analyze audio file for specific event labels and print detected events with timestamps.
+    output_cdrt_transcripts: bool, whether to output CDRT-format transcripts for submission.
+    If output_cdrt_transcripts is True, the output will be saved to a .csv file, in the format of:
+    CD or DVD label, File name of recording, 
+    Time location within recording in <HH:MM:SS> to <HH:MM:SS> format, Event Transcript
+    https://www.judiciary.gov.sg/civil/prepare-evidence-neighbour-dispute-claim
     """
+
+    # input_file is the full path (relative or absolute) to the audio file.
     # Define audio file and event descriptions
-    input_trunk = input_file.rsplit(".", 1)[0]
+    dvd_label, file_trunk = None, None
+    is_meter_video = False
     # Try to extract start time from filename
     m1 = PATTERN1.search(input_file) # Reolink camera recordings.
     m2 = PATTERN2.search(input_file) # Manually recorded videos by phones.
+    m3 = PATTERN3.search(input_file) # CDRT submissions.
     if m1:
         start_date = m1.group("date")
         start_time = m1.group("start")
@@ -398,23 +441,42 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
         # db offset for phone recordings, calibrated against DB meter readings.
         # Phones have less sensitive microphones, so we use a higher dB offset.
         db_offset = 95
+        is_meter_video = True
+    elif m3:
+        start_date = m3.group("date")
+        start_time = m3.group("start")
+        # date: "08 August 2025"
+        date_obj = datetime.strptime(start_date, "%d %B %Y")
+        year, month, day = date_obj.year, date_obj.month, date_obj.day
+        hr, minute, second = map(int, start_time.split("-"))
+        start_date_obj = datetime(year, month, day, hr, minute, second)
+        if m3.group("desc").lower() == "kitchen noises":
+            # db offset for phone recordings without sound level meter app, calibrated against DB meter readings.
+            db_offset = 85
+        elif m3.group("desc").lower() == "kitchen noises (sound level meter)":
+            # db offset for phone recordings with sound level meter app, calibrated against DB meter readings.
+            db_offset = 95
+            is_meter_video = True
+        else:
+            db_offset = default_db_offset
+            breakpoint() # SHouldn't reach here.
+
+        if output_cdrt_transcripts:
+            parent_dir = Path(input_file).parent
+            file_trunk = Path(input_file).stem
+            dvd_label = dvd_label_mapping[parent_dir.name]
     else:
         print(f"Warning: Could not extract start time from filename {os.path.basename(input_file)}. Output relative time instead.")
         print_abs_time = False
         start_date_obj = None
         db_offset = default_db_offset
 
-    # If MP4, extract to WAV once
-    if input_file.lower().endswith(".mp4"):
-        audio_file = input_trunk + ".wav"
-        if not os.path.exists(audio_file):
-            print(f"Extracting audio from {input_file} -> {audio_file} ...")
-            video = AudioSegment.from_file(input_file, format="mp4")
-            video.export(audio_file, format="wav")
-    else:
-        audio_file = input_file
-
     # -------------------- load + resample once --------------------
+    # NOTE: here we directly load the mp4 file using torchaudio.load(), and get the audio track.
+    # If your torchaudio has an FFmpeg backend available, torchaudio.load("video.mp4") 
+    # can load the audio track from an MP4.
+    # If you only have the SoX backend, it generally won’t load MP4 
+    # (SoX doesn’t handle MP4 containers by default).
     wav, sr = torchaudio.load(input_file)  # wav: (channels, samples)
     # Video/Audio recorded by phones.
     if wav.shape[0] == 2:
@@ -502,7 +564,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
         # Merge the same type of events, if their time gap <= 2 seconds, and the dBFS difference <= 3.0 dB.
         num_merges = 0
         while True:
-            spans = merge_intervals(desc2intervals[description], time_tolerance=2, db_max_gap=3.0)
+            spans = merge_intervals(desc2intervals[description], time_tolerance=2, db_max_gap=args.db_max_gap)
             num_merges += 1
             desc2intervals[description] = spans
             if len(spans) == len(desc2intervals[description]):
@@ -535,18 +597,21 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
 
     if len(all_events) == 0:
         print("No events detected in the audio.")
-        return {}, None, 0
+        return {}, None, 0, False
     
     # merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
     # Otherwise, the overlap timeline merging algorithm may discard some overlapped events.
     merge_events_along_timeline(all_events, start_date_obj=start_date_obj if print_abs_time else None,
-                                time_tolerance=2, db_max_gap=3.0, debug=debug)
+                                time_tolerance=2, db_max_gap=args.db_max_gap, 
+                                output_cdrt_transcripts=output_cdrt_transcripts,
+                                dvd_label=dvd_label, file_trunk=file_trunk, cdrt_transcript_fh=cdrt_transcript_fh,
+                                debug=debug)
     wav_demeaned = wav_demeaned.to(device)
     avg_dbfs = calc_dbfs(wav_demeaned, db_offset, search_peak_window_len=-1)
     print(f"Average Audio dBFS: {avg_dbfs:.1f}db")
     if event_db_mask.sum() == 0:
         print("No events detected, skipping event dBFS analysis.")
-        return {}, None, 0
+        return {}, None, 0, False
     
     nonevent_mask = (event_db_mask == 0)
     all_nonevent_dbfs = extract_event_segments_from_mask(wav_demeaned, nonevent_mask, sr, db_offset)
@@ -594,11 +659,52 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     prob_mean=span_stat.prob_mean,
                     prob_max=span_stat.prob_max,
                 )
-    return all_events, start_date_obj, avg_nonevent_dbfs
+    return all_events, start_date_obj, avg_nonevent_dbfs, is_meter_video
     
 if __name__ == "__main__":
     args = parser.parse_args()
     device = "cuda"
+
+    input_files = []
+    if args.input_folders:
+        # Process all mp4 files in the input folders
+        for folder in args.input_folders:
+            root = Path(folder)
+            # Don't include .wav files, as they are converted from .mp4 files.
+            # We don't count the .wav files to avoid duplicate processing.
+            files = sorted(root.rglob("*.mp4"))
+            for input_file in files:
+                input_files.append(str(input_file))
+
+    elif args.input_files:
+        input_files.extend(args.input_files)
+    else:
+        print("Error: Please provide either --input_folder or --input_file.")
+        exit(1)
+
+    if args.output_cdrt_transcripts:
+        if args.dvd_label_mapping_file is None:
+            print("Error: Please provide --dvd_label_mapping_file when --output_cdrt_transcripts is set to True.")
+            exit(1)
+        # Load DVD label mapping
+        dvd_label_mapping = {}
+        with open(args.dvd_label_mapping_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    print(f"Warning: Invalid line in DVD label mapping file: {line}")
+                    continue
+                folder_name, dvd_label = parts
+                dvd_label_mapping[folder_name] = dvd_label
+        cdrt_transcript_header = "CD or DVD label,File name of recording,Time location within recording,Transcript"
+        CDRT_TRANSCRIPT = open(os.path.join(args.output_dir, "cdrt_transcripts.csv"), "w")
+    else:
+        dvd_label_mapping = None
+        CDRT_TRANSCRIPT   = None
+
     # Load the model and transform.
     # The 'large' model takes 30GB GPU memory for inference with batch size 1.
     # It takes 40 minutes to process all 167 reolink recordings on a single NVIDIA RTX 6000 Ada GPU.
@@ -619,9 +725,9 @@ if __name__ == "__main__":
         "kitchen clatter and clank": 0.5,
         "thud or thump": 0.6,
         "clack and clunk": 0.6,
-        "chopping or cutting": 0.4,
+        "chopping or cutting": 0.5,
         "human talking": 0.65,
-        "oil sizzle": 0.5,
+        "oil sizzle": 0.6,
         "water splattering": 0.5,
         "plastic bag rustle": 0.5,
     }
@@ -645,29 +751,10 @@ if __name__ == "__main__":
         "plastic bag rustle": 50,
     }
 
-    input_files = []
-    if args.input_folder:
-        # Process all mp4 files in the input folder
-        output_dir = args.input_folder
-        root = Path(args.input_folder)
-        files = sorted(root.rglob("*.mp4"))
-        for input_file in files:
-            # Only include files in subfolders, which are reolink recordings.
-            # Skip files directly under root folder, which are manually recorded videos (for calibration only).
-            if input_file.parent != root:
-                input_files.append(str(input_file))
-
-    elif args.input_file:
-        output_dir = os.path.dirname(args.input_file)
-        input_files.append(args.input_file)
-    else:
-        print("Error: Please provide either --input_folder or --input_file.")
-        exit(1)
-
     for input_file in tqdm(input_files):
         print(f"\nAnalyzing audio file: {input_file}")
          # Analyze audio labels
-        all_events, start_date_obj, avg_nonevent_dbfs = \
+        all_events, start_date_obj, avg_nonevent_dbfs, is_meter_video = \
             analyze_audio_labels(
                 model=model,
                 transform=transform,
@@ -682,6 +769,9 @@ if __name__ == "__main__":
                 search_peak_window_sec=args.search_peak_window_sec,
                 device=device,
                 print_abs_time=args.abs_time,
+                output_cdrt_transcripts=args.output_cdrt_transcripts,
+                dvd_label_mapping=dvd_label_mapping,
+                cdrt_transcript_fh=CDRT_TRANSCRIPT,
                 debug=args.debug,
             )
 
@@ -689,7 +779,7 @@ if __name__ == "__main__":
             # Output CLEF-format results for Seq visualization
             output_file = start_date_obj.strftime("%Y%m%d_%H%M%S_events.clef") if start_date_obj else \
                           os.path.basename(input_file).rsplit(".", 1)[0] + "_events.clef"
-            output_file = os.path.join(output_dir, output_file)
+            output_file = os.path.join(args.output_dir, output_file)
 
             with open(output_file, "w") as f:
                 for label, spans in all_events.items():
@@ -713,6 +803,7 @@ if __name__ == "__main__":
                             "DbDelta": round(span_stat.dbfs - avg_nonevent_dbfs, 1),
                             "SegmentStart": span_stat.start[-5:],
                             "SegmentEnd": span_stat.end[-5:],
+                            "IsMeterVideo": is_meter_video,
                         }) + "\n")
 
             print(f"CLEF-format results written to {output_file}")

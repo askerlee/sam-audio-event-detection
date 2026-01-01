@@ -6,7 +6,6 @@ import argparse
 import torch
 import torchaudio
 import torchaudio.functional as F
-from pydub import AudioSegment
 from tqdm import tqdm
 
 from sam_audio import SAMAudio, SAMAudioProcessor
@@ -54,15 +53,6 @@ processor = SAMAudioProcessor.from_pretrained(model_id)
 
 input_file = args.input_file
 input_trunk = input_file.rsplit(".", 1)[0]
-
-# If MP4, extract to WAV once
-if input_file.lower().endswith(".mp4"):
-    audio_file = input_trunk + ".wav"
-    if not os.path.exists(audio_file):
-        print(f"Extracting audio from {input_file} -> {audio_file} ...")
-        video = AudioSegment.from_file(input_file, format="mp4")
-        video.export(audio_file, format="wav")
-    input_file = audio_file
 
 # -------------------- load + resample once --------------------
 wav, sr = torchaudio.load(input_file)  # wav: (channels, samples)
