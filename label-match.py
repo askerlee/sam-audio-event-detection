@@ -168,13 +168,15 @@ def extract_event_segments_from_mask(audio: torch.Tensor, mask: torch.Tensor, sa
         segment_audio = audio[:, start_idx:end_idx]
         if segment_audio.shape[1] > 0:
             # Compute dBFS for this segment
-            segment_dbfs = calc_dbfs(segment_audio, db_offset, search_peak_window_len=-1)
+            segment_dbfs = calc_dbfs(segment_audio, db_offset, search_peak_window_len=-1, 
+                                     sel_top_percent=-1)
             duration_seconds = (end_idx - start_idx) / sample_rate
             segments.append((segment_dbfs, duration_seconds))
     
     return segments
 
-def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[datetime] = None, 
+def merge_events_along_timeline(all_events: Events, avg_nonevent_dbfs: float, 
+                                start_date_obj: Optional[datetime] = None, 
                                 time_tolerance: int = 0, db_max_gap: float = 0.0,
                                 output_cdrt_transcripts: bool = False,
                                 dvd_label: Optional[str] = None, file_trunk: Optional[str] = None,
@@ -232,10 +234,15 @@ def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[dat
     def print_seg_labels(seg_start: int, seg_end: int, label2span_stat: dict, 
                          start_date_obj: Optional[datetime] = None):
         if label2span_stat:
+            db_str = f"{span_stat.dbfs:.1f}db"
+            # Force show +/- relative to avg_nonevent_dbfs
+            rel_db_str  = f"{span_stat.dbfs - avg_nonevent_dbfs:+.1f}db"
+            full_db_str = f"{db_str}/{rel_db_str}"
+
             if debug:
-                labels_str = ", ".join(f"{label} ({span_stat.prob_max:.2f}/{span_stat.prob_mean:.2f}/{span_stat.dbfs:.1f}db)" for label, span_stat in sorted(label2span_stat.items()))
+                labels_str = ", ".join(f"{label} ({span_stat.prob_max:.2f}/{span_stat.prob_mean:.2f}/{full_db_str})" for label, span_stat in sorted(label2span_stat.items()))
             else:
-                labels_str = ", ".join(f"{label} ({span_stat.dbfs:.1f}db)" for label, span_stat in sorted(label2span_stat.items()))
+                labels_str = ", ".join(f"{label} ({full_db_str})" for label, span_stat in sorted(label2span_stat.items()))
             if start_date_obj:
                 seg_start_dt = start_date_obj + timedelta(seconds=seg_start)
                 seg_end_dt   = start_date_obj + timedelta(seconds=seg_end)
@@ -258,7 +265,7 @@ def merge_events_along_timeline(all_events: Events, start_date_obj: Optional[dat
                 # 00:01:52 to 00:01:55,kitchen clatter and clank (72.5db)
                 # 00:01:56 to 00:01:57,kitchen clatter and clank (60.0db)
                 # The examiner can then see the difference and may better understand why the events are split.
-                event_transcript = "; ".join(f"{label} ({span_stat.dbfs:.1f}db)" for label, span_stat in sorted(label2span_stat.items()))
+                event_transcript = "; ".join(f"{label} ({full_db_str})" for label, span_stat in sorted(label2span_stat.items()))
                 cdrt_transcript_fh.write(f"{dvd_label},{file_trunk},00:{sec_to_mmss(seg_start)} to 00:{sec_to_mmss(seg_end)},{event_transcript}\n")
 
     for t in range(t0 + 1, t1 + 2):  # +2 to flush the last segment
@@ -394,7 +401,8 @@ def PEAudioFrame_forward(
     )
 
 # Assume wav has been demean'ed.
-def calc_dbfs(wav: torch.Tensor, db_offset: float, search_peak_window_len: float=-1) -> float:
+def calc_dbfs(wav: torch.Tensor, db_offset: float, 
+              search_peak_window_len: float=-1, sel_top_percent: float=0.33) -> float:
     rms = torch.sqrt(torch.mean(wav**2))
     dbfs = 20.0 * torch.log10(torch.clamp(rms, min=1e-12)) + db_offset
 
@@ -413,10 +421,10 @@ def calc_dbfs(wav: torch.Tensor, db_offset: float, search_peak_window_len: float
             dbfs = 20.0 * torch.log10(torch.clamp(rms, min=1e-12)) + db_offset
             dbfs_values.append(dbfs)
 
-        # Take the average of the top 20% highest dBFS values as the peak dBFS.
-        top_20_percent_count = max(1, len(dbfs_values) // 5)
-        top_20_percent_values = sorted(dbfs_values, reverse=True)[:top_20_percent_count]
-        dbfs_peak = sum(top_20_percent_values) / len(top_20_percent_values)
+        # Take the average of the higest 1/3 dBFS values as the peak dBFS.
+        sel_top_count = max(1, int(len(dbfs_values) * sel_top_percent))
+        sel_top_values = sorted(dbfs_values, reverse=True)[:sel_top_count]
+        dbfs_peak = sum(sel_top_values) / len(sel_top_values)
         return dbfs.item(), dbfs_peak.item()
     else:
         return dbfs.item()
@@ -447,6 +455,8 @@ parser.add_argument("--default_db_offset", type=float, default=85,
 parser.add_argument("--loud_db_offset", type=float, default=8.0, help="dB offset above average event dBFS to consider an event 'loud'")
 parser.add_argument("--search_peak_window_sec", type=float, default=0.2, 
                     help="Window length in seconds to search for peak dBFS within an event span (set to -1 to disable)")
+parser.add_argument("--calc_db_sel_top_percent", type=float, default=0.33, 
+                    help="When calculating peak dBFS within an event span, select the top N% dBFS values and average them")
 parser.add_argument("--db_max_gap", type=float, default=5.0,
                     help="Max dBFS gap to merge same event types along timeline")
 parser.add_argument("--abs_time", type=str2bool, nargs='?', const=True, default=False, 
@@ -557,7 +567,9 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                     global_end     = int(global_end_s * sr)
                     # Take the span from the original chunk (not resampled).
                     span_sound = chunk_demeaned[:, start:end]
-                    dbfs, dbfs_peak = calc_dbfs(span_sound, db_offset, search_peak_window_len=search_peak_window_sec * sr)
+                    dbfs, dbfs_peak = calc_dbfs(span_sound, db_offset, 
+                                                search_peak_window_len=search_peak_window_sec * sr,
+                                                sel_top_percent=args.calc_db_sel_top_percent)
                     # NOTE: The loudest part usually determines how disturbing the event is. 
                     # Also the loudest part will linger in attention for a short while 
                     # (usually long enough to last through the whole span, and only fades out till much later).
@@ -614,16 +626,9 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
     if len(all_events) == 0:
         print("No events detected in the audio.")
         return {}, None, 0, False
-    
-    # merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
-    # Otherwise, the overlap timeline merging algorithm may discard some overlapped events.
-    merge_events_along_timeline(all_events, start_date_obj=start_date_obj if print_abs_time else None,
-                                time_tolerance=2, db_max_gap=args.db_max_gap, 
-                                output_cdrt_transcripts=output_cdrt_transcripts,
-                                dvd_label=dvd_label, file_trunk=file_trunk, cdrt_transcript_fh=cdrt_transcript_fh,
-                                debug=debug)
+
     wav_demeaned = wav_demeaned.to(device)
-    avg_dbfs = calc_dbfs(wav_demeaned, db_offset, search_peak_window_len=-1)
+    avg_dbfs = calc_dbfs(wav_demeaned, db_offset, search_peak_window_len=-1, sel_top_percent=-1)
     print(f"Average Audio dBFS: {avg_dbfs:.1f}db")
     if event_db_mask.sum() == 0:
         print("No events detected, skipping event dBFS analysis.")
@@ -652,6 +657,15 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
         print(f"Duration of Loud Events (> avg + {loud_db_offset}dB): {(event_db_mask > avg_nonevent_dbfs + loud_db_offset).sum().item() / sr:.1f} seconds")
         avg_loud_dbfs = event_db_mask[event_db_mask > avg_nonevent_dbfs + loud_db_offset].mean().item()
         print(f"Avg dBFS of Loud Events: {avg_loud_dbfs:.1f}db = Average + {avg_loud_dbfs - avg_nonevent_dbfs:.1f}db")
+
+    # merge_events_along_timeline uses a time_tolerance <= the time_tolerance used in merging events above.
+    # Otherwise, the overlap timeline merging algorithm may discard some overlapped events.
+    merge_events_along_timeline(all_events, avg_nonevent_dbfs=avg_nonevent_dbfs,
+                                start_date_obj=start_date_obj if print_abs_time else None,
+                                time_tolerance=2, db_max_gap=args.db_max_gap, 
+                                output_cdrt_transcripts=output_cdrt_transcripts,
+                                dvd_label=dvd_label, file_trunk=file_trunk, cdrt_transcript_fh=cdrt_transcript_fh,
+                                debug=debug)
 
     if start_date_obj:
         # Adjust all_events to absolute time
@@ -719,7 +733,7 @@ if __name__ == "__main__":
                 folder_name, dvd_label = parts
                 dvd_label_mapping[folder_name] = dvd_label
         cdrt_transcript_header = "CD or DVD label,File name of recording,Time location within recording,Transcript"
-        CDRT_TRANSCRIPT = open(os.path.join(args.output_folder, "cdrt_transcripts.csv"), "w")
+        CDRT_TRANSCRIPT = open(os.path.join(args.output_folder, "cdrt-transcripts.csv"), "w")
     else:
         dvd_label_mapping = None
         CDRT_TRANSCRIPT   = None
