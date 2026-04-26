@@ -122,6 +122,12 @@ def mmss_to_sec(t: str) -> int:
 def sec_to_mmss(x: int) -> str:
     return f"{x//60:02d}:{x%60:02d}"
 
+def sec_to_srt_timestamp(x: int) -> str:
+    hours = x // 3600
+    minutes = (x % 3600) // 60
+    seconds = x % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},000"
+
 def merge_intervals(intervals: Iterable[Interval], time_tolerance: float = 0.0, db_max_gap: float = 0.0) -> List[Interval]:
     xs = sorted((s, e, p, db) for s, e, p, db in intervals)
     merged: List[Interval] = []
@@ -181,6 +187,7 @@ def merge_events_along_timeline(all_events: Events, avg_nonevent_dbfs: float,
                                 output_cdrt_transcripts: bool = False,
                                 dvd_label: Optional[str] = None, file_trunk: Optional[str] = None,
                                 cdrt_transcript_fh: Optional[TextIO] = None,
+                                srt_fh: Optional[TextIO] = None,
                                 debug=False) -> None:
     """
     Prints segments in time order.
@@ -230,9 +237,11 @@ def merge_events_along_timeline(all_events: Events, avg_nonevent_dbfs: float,
 
     seg_start = t0
     curr_labels = seconds_painted_with_labels.get(t0, dict())
+    srt_index = 1
 
     def print_seg_labels(seg_start: int, seg_end: int, label2span_stat: dict, 
                          start_date_obj: Optional[datetime] = None):
+        nonlocal srt_index
         if label2span_stat:
             db_str = f"{span_stat.dbfs:.1f}db"
             # Force show +/- relative to avg_nonevent_dbfs
@@ -250,6 +259,12 @@ def merge_events_along_timeline(all_events: Events, avg_nonevent_dbfs: float,
                 print(f"{abs_time}/{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
             else:
                 print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
+
+            if srt_fh:
+                srt_fh.write(f"{srt_index}\n")
+                srt_fh.write(f"{sec_to_srt_timestamp(seg_start)} --> {sec_to_srt_timestamp(seg_end + 1)}\n")
+                srt_fh.write(labels_str.replace(", ", "\n") + "\n\n")
+                srt_index += 1
 
             if output_cdrt_transcripts and cdrt_transcript_fh:
                 # We always output relative time, regardless of whether start_date_obj is given.
@@ -296,7 +311,6 @@ def merge_events_along_timeline(all_events: Events, avg_nonevent_dbfs: float,
                         # so we cannot merge this label. If a label is not mergeable, 
                         # then these two spans are not mergeable.
                         mergeable = False
-                        #breakpoint()
                         break
                     # start and end don't matter, as we only use dbfs, prob_mean, prob_max for printing.
                     # So start and end are simply taken from existing_stat.
@@ -464,6 +478,8 @@ parser.add_argument("--abs_time", type=str2bool, nargs='?', const=True, default=
 parser.add_argument("--output_folder", type=str, default=".", help="Directory to save output results")
 parser.add_argument("--output_clef", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to output CLEF-format results for Seq visualization")
+parser.add_argument("--output_srt", type=str2bool, nargs='?', const=True, default=False,
+                    help="Whether to output SRT subtitle files")
 parser.add_argument("--output_cdrt_transcripts", type=str2bool, nargs='?', const=True, default=False, 
                     help="Whether to output CDRT-format transcripts for submission")
 parser.add_argument("--dvd_label_mapping_file", type=str, default=None,
@@ -478,6 +494,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                          device: str, print_abs_time: bool, output_cdrt_transcripts: bool, 
                          dvd_label_mapping: Optional[Dict[str, str]], 
                          cdrt_transcript_fh: Optional[TextIO],
+                         srt_fh: Optional[TextIO],
                          debug: bool):
     """
     Analyze audio file for specific event labels and print detected events with timestamps.
@@ -665,6 +682,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                                 time_tolerance=2, db_max_gap=args.db_max_gap, 
                                 output_cdrt_transcripts=output_cdrt_transcripts,
                                 dvd_label=dvd_label, file_trunk=file_trunk, cdrt_transcript_fh=cdrt_transcript_fh,
+                                srt_fh=srt_fh,
                                 debug=debug)
 
     if start_date_obj:
@@ -787,26 +805,40 @@ if __name__ == "__main__":
     for input_filepath in tqdm(input_filepaths):
         print(f"\nAnalyzing audio file: {input_filepath}")
          # Analyze audio labels
-        all_events, start_date_obj, avg_nonevent_dbfs, is_meter_video = \
-            analyze_audio_labels(
-                model=model,
-                transform=transform,
-                input_filepath=input_filepath,
-                segment_seconds=args.segment_seconds,
-                sample_rate=args.sample_rate,
-                weak_thres_discount=args.weak_thres_discount,
-                default_db_offset=args.default_db_offset,
-                loud_db_offset=args.loud_db_offset,
-                desc2det_thres=desc2det_thres,
-                desc2db_thres=desc2db_thres,
-                search_peak_window_sec=args.search_peak_window_sec,
-                device=device,
-                print_abs_time=args.abs_time,
-                output_cdrt_transcripts=args.output_cdrt_transcripts,
-                dvd_label_mapping=dvd_label_mapping,
-                cdrt_transcript_fh=CDRT_TRANSCRIPT,
-                debug=args.debug,
+        srt_output_file = None
+        if args.output_srt:
+            srt_output_folder = os.path.join(args.output_folder, "srt")
+            os.makedirs(srt_output_folder, exist_ok=True)
+            srt_output_file = os.path.join(
+                srt_output_folder,
+                os.path.basename(input_filepath).rsplit(".", 1)[0] + ".srt",
             )
+
+        with open(srt_output_file, "w") if srt_output_file else open(os.devnull, "w") as srt_fh:
+            all_events, start_date_obj, avg_nonevent_dbfs, is_meter_video = \
+                analyze_audio_labels(
+                    model=model,
+                    transform=transform,
+                    input_filepath=input_filepath,
+                    segment_seconds=args.segment_seconds,
+                    sample_rate=args.sample_rate,
+                    weak_thres_discount=args.weak_thres_discount,
+                    default_db_offset=args.default_db_offset,
+                    loud_db_offset=args.loud_db_offset,
+                    desc2det_thres=desc2det_thres,
+                    desc2db_thres=desc2db_thres,
+                    search_peak_window_sec=args.search_peak_window_sec,
+                    device=device,
+                    print_abs_time=args.abs_time,
+                    output_cdrt_transcripts=args.output_cdrt_transcripts,
+                    dvd_label_mapping=dvd_label_mapping,
+                    cdrt_transcript_fh=CDRT_TRANSCRIPT,
+                    srt_fh=srt_fh if srt_output_file else None,
+                    debug=args.debug,
+                )
+
+        if srt_output_file and all_events:
+            print(f"SRT subtitles written to {srt_output_file}")
 
         if args.output_clef and all_events:
             # Output CLEF-format results for Seq visualization
