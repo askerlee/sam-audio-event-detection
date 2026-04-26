@@ -128,6 +128,16 @@ We additional release another variant (in each size) that is better specifically
 
 See the [eval](eval) directory for instructions and scripts to reproduce results from the paper
 
+## Whisper Transcription Utility
+
+If you want plain speech recognition over a folder of talking videos, use the standalone Whisper script in the repo root:
+
+```bash
+python transcribe-human-talking.py /path/to/videos --recursive --language en
+```
+
+By default it uses `openai/whisper-large-v3`, loads the audio track from each video with `torchaudio`, and prints the recognized text for each file.
+
 ## Contributing
 
 See [contributing](CONTRIBUTING.md) and [code of conduct](CODE_OF_CONDUCT.md) for more information.
