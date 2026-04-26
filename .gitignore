@@ -7,3 +7,4 @@ dist
 .checkpoints
 .ipynb_checkpoints
 srt/*
+human-talkings/*

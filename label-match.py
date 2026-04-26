@@ -130,21 +130,21 @@ def sec_to_srt_timestamp(x: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},000"
 
 def sec_to_filename_timestamp(x: int) -> str:
-    hours = x // 3600
     minutes = (x % 3600) // 60
     seconds = x % 60
-    return f"{hours:02d}-{minutes:02d}-{seconds:02d}"
+    return f"{minutes:02d}-{seconds:02d}"
 
-def dump_detected_video_segments(input_filepath: str, spans: List[SpanStat], output_dir: Path) -> None:
+def dump_detected_video_segments(input_filepath: str, spans: List[SpanStat], output_dir: Path) -> int:
     if not spans:
-        return
+        return 0
 
     if Path(input_filepath).suffix.lower() != ".mp4":
         print(f"Warning: Skipping human talking dump for non-MP4 input {input_filepath}.")
-        return
+        return 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
     input_stem = Path(input_filepath).stem
+    saved_count = 0
 
     for span_stat in spans:
         start_sec = mmss_to_sec(span_stat.start)
@@ -173,6 +173,7 @@ def dump_detected_video_segments(input_filepath: str, spans: List[SpanStat], out
         ]
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            saved_count += 1
         except FileNotFoundError:
             raise RuntimeError("ffmpeg is required for --dump-human-talking but was not found in PATH.")
         except subprocess.CalledProcessError as exc:
@@ -180,6 +181,8 @@ def dump_detected_video_segments(input_filepath: str, spans: List[SpanStat], out
             raise RuntimeError(
                 f"ffmpeg failed while dumping human talking segment to {output_path}: {stderr}"
             ) from exc
+
+    return saved_count
 
 def filter_competing_segment_labels(label2span_stat: Dict[str, SpanStat],
                                     max_prob_gap: float = 0.15) -> Dict[str, SpanStat]:
@@ -556,8 +559,8 @@ parser.add_argument("--output_cdrt_transcripts", type=str2bool, nargs='?', const
                     help="Whether to output CDRT-format transcripts for submission")
 parser.add_argument("--dvd_label_mapping_file", type=str, default=None,
                     help="Path to DVD label mapping .txt file (if outputting CDRT-format transcripts)")
-parser.add_argument("--dump-human-talking", dest="dump_human_talking", type=str, default=None,
-                    help="If set, save detected human talking segments as MP4 clips under this subfolder path")
+parser.add_argument("--dump_human_talking", type=str, nargs='?', const="human-talkings", default=None,
+                    help="If set, save detected human talking segments as MP4 clips; if no path is given, use each input video's human-talkings subfolder")
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 
 def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
@@ -761,11 +764,12 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                                 debug=debug)
 
     if dump_human_talking_dir is not None:
-        dump_detected_video_segments(
+        saved_count = dump_detected_video_segments(
             input_filepath=input_filepath,
             spans=all_events.get("human talking", []),
             output_dir=dump_human_talking_dir,
         )
+        print(f"Saved {saved_count} human talking segments to {dump_human_talking_dir}")
 
     if start_date_obj:
         # Adjust all_events to absolute time
@@ -838,12 +842,6 @@ if __name__ == "__main__":
         dvd_label_mapping = None
         CDRT_TRANSCRIPT   = None
 
-    dump_human_talking_dir = None
-    if args.dump_human_talking:
-        dump_human_talking_dir = Path(args.dump_human_talking)
-        if not dump_human_talking_dir.is_absolute():
-            dump_human_talking_dir = Path(args.output_folder) / dump_human_talking_dir
-
     # Load the model and transform.
     # The 'large' model takes 30GB GPU memory for inference with batch size 1.
     # It takes 40 minutes to process all 167 reolink recordings on a single NVIDIA RTX 6000 Ada GPU.
@@ -893,6 +891,15 @@ if __name__ == "__main__":
     for input_filepath in tqdm(input_filepaths):
         print(f"\nAnalyzing audio file: {input_filepath}")
          # Analyze audio labels
+        dump_human_talking_dir = None
+        if args.dump_human_talking is not None:
+            if args.dump_human_talking == "human-talkings":
+                dump_human_talking_dir = Path(input_filepath).parent / "human-talkings"
+            else:
+                dump_human_talking_dir = Path(args.dump_human_talking)
+                if not dump_human_talking_dir.is_absolute():
+                    dump_human_talking_dir = Path(args.output_folder) / dump_human_talking_dir
+
         srt_output_file = None
         if args.output_srt:
             if args.output_folder == ".":
