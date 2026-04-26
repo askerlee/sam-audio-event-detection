@@ -8,6 +8,7 @@ import os
 import re
 import math
 import argparse
+import subprocess
 from tqdm import tqdm
 from typing import Iterable, List, Tuple, Dict, Union, Optional, TextIO
 from collections import defaultdict, namedtuple
@@ -128,6 +129,71 @@ def sec_to_srt_timestamp(x: int) -> str:
     seconds = x % 60
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},000"
 
+def sec_to_filename_timestamp(x: int) -> str:
+    hours = x // 3600
+    minutes = (x % 3600) // 60
+    seconds = x % 60
+    return f"{hours:02d}-{minutes:02d}-{seconds:02d}"
+
+def dump_detected_video_segments(input_filepath: str, spans: List[SpanStat], output_dir: Path) -> None:
+    if not spans:
+        return
+
+    if Path(input_filepath).suffix.lower() != ".mp4":
+        print(f"Warning: Skipping human talking dump for non-MP4 input {input_filepath}.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_stem = Path(input_filepath).stem
+
+    for span_stat in spans:
+        start_sec = mmss_to_sec(span_stat.start)
+        end_sec = mmss_to_sec(span_stat.end) + 1
+        if end_sec <= start_sec:
+            end_sec = start_sec + 1
+
+        output_path = output_dir / (
+            f"{input_stem}_human-talking_"
+            f"{sec_to_filename_timestamp(start_sec)}-"
+            f"{sec_to_filename_timestamp(end_sec)}.mp4"
+        )
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start_sec),
+            "-to",
+            str(end_sec),
+            "-i",
+            input_filepath,
+            "-c",
+            "copy",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            raise RuntimeError("ffmpeg is required for --dump-human-talking but was not found in PATH.")
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.strip()
+            raise RuntimeError(
+                f"ffmpeg failed while dumping human talking segment to {output_path}: {stderr}"
+            ) from exc
+
+def filter_competing_segment_labels(label2span_stat: Dict[str, SpanStat],
+                                    max_prob_gap: float = 0.15) -> Dict[str, SpanStat]:
+    if len(label2span_stat) <= 1:
+        return label2span_stat
+
+    max_prob = max(span_stat.prob_max for span_stat in label2span_stat.values())
+    filtered_labels = {
+        label: span_stat
+        for label, span_stat in label2span_stat.items()
+        if span_stat.prob_max >= max_prob - max_prob_gap
+    }
+    return filtered_labels or label2span_stat
+
 def merge_intervals(intervals: Iterable[Interval], time_tolerance: float = 0.0, db_max_gap: float = 0.0) -> List[Interval]:
     xs = sorted((s, e, p, db) for s, e, p, db in intervals)
     merged: List[Interval] = []
@@ -243,6 +309,7 @@ def merge_events_along_timeline(all_events: Events, avg_nonevent_dbfs: float,
                          start_date_obj: Optional[datetime] = None):
         nonlocal srt_index
         if label2span_stat:
+            label2span_stat = filter_competing_segment_labels(label2span_stat)
             db_str = f"{span_stat.dbfs:.1f}db"
             # Force show +/- relative to avg_nonevent_dbfs
             rel_db_str  = f"{span_stat.dbfs - avg_nonevent_dbfs:+.1f}db"
@@ -261,9 +328,14 @@ def merge_events_along_timeline(all_events: Events, avg_nonevent_dbfs: float,
                 print(f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {labels_str}")
 
             if srt_fh:
+                srt_labels_str = "\n".join(
+                    f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {label} ({span_stat.prob_max:.2f}/{span_stat.prob_mean:.2f}/{full_db_str})"
+                    if debug else f"{sec_to_mmss(seg_start)}-{sec_to_mmss(seg_end)}: {label} ({full_db_str})"
+                    for label, span_stat in sorted(label2span_stat.items())
+                )
                 srt_fh.write(f"{srt_index}\n")
                 srt_fh.write(f"{sec_to_srt_timestamp(seg_start)} --> {sec_to_srt_timestamp(seg_end + 1)}\n")
-                srt_fh.write(labels_str.replace(", ", "\n") + "\n\n")
+                srt_fh.write(srt_labels_str + "\n\n")
                 srt_index += 1
 
             if output_cdrt_transcripts and cdrt_transcript_fh:
@@ -484,6 +556,8 @@ parser.add_argument("--output_cdrt_transcripts", type=str2bool, nargs='?', const
                     help="Whether to output CDRT-format transcripts for submission")
 parser.add_argument("--dvd_label_mapping_file", type=str, default=None,
                     help="Path to DVD label mapping .txt file (if outputting CDRT-format transcripts)")
+parser.add_argument("--dump-human-talking", dest="dump_human_talking", type=str, default=None,
+                    help="If set, save detected human talking segments as MP4 clips under this subfolder path")
 parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True, help="Whether to print debug info")
 
 def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform, 
@@ -492,6 +566,7 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                          desc2det_thres: Dict[str, float], desc2db_thres: Dict[str, float],
                          search_peak_window_sec: float,
                          device: str, print_abs_time: bool, output_cdrt_transcripts: bool, 
+                         dump_human_talking_dir: Optional[Path],
                          dvd_label_mapping: Optional[Dict[str, str]], 
                          cdrt_transcript_fh: Optional[TextIO],
                          srt_fh: Optional[TextIO],
@@ -685,6 +760,13 @@ def analyze_audio_labels(model: PEAudioFrame, transform: PEAudioFrameTransform,
                                 srt_fh=srt_fh,
                                 debug=debug)
 
+    if dump_human_talking_dir is not None:
+        dump_detected_video_segments(
+            input_filepath=input_filepath,
+            spans=all_events.get("human talking", []),
+            output_dir=dump_human_talking_dir,
+        )
+
     if start_date_obj:
         # Adjust all_events to absolute time
         # all_events: label -> list of SpanStat
@@ -755,6 +837,12 @@ if __name__ == "__main__":
     else:
         dvd_label_mapping = None
         CDRT_TRANSCRIPT   = None
+
+    dump_human_talking_dir = None
+    if args.dump_human_talking:
+        dump_human_talking_dir = Path(args.dump_human_talking)
+        if not dump_human_talking_dir.is_absolute():
+            dump_human_talking_dir = Path(args.output_folder) / dump_human_talking_dir
 
     # Load the model and transform.
     # The 'large' model takes 30GB GPU memory for inference with batch size 1.
@@ -834,6 +922,7 @@ if __name__ == "__main__":
                     device=device,
                     print_abs_time=args.abs_time,
                     output_cdrt_transcripts=args.output_cdrt_transcripts,
+                    dump_human_talking_dir=dump_human_talking_dir,
                     dvd_label_mapping=dvd_label_mapping,
                     cdrt_transcript_fh=CDRT_TRANSCRIPT,
                     srt_fh=srt_fh if srt_output_file else None,
