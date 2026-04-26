@@ -807,7 +807,10 @@ if __name__ == "__main__":
          # Analyze audio labels
         srt_output_file = None
         if args.output_srt:
-            srt_output_folder = os.path.join(args.output_folder, "srt")
+            if args.output_folder == ".":
+                srt_output_folder = os.path.dirname(input_filepath) or "."
+            else:
+                srt_output_folder = os.path.join(args.output_folder, "srt")
             os.makedirs(srt_output_folder, exist_ok=True)
             srt_output_file = os.path.join(
                 srt_output_folder,
