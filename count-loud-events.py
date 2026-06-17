@@ -8,13 +8,14 @@ EVENT_DB_PATTERN = re.compile(
     r"\((?P<absolute>[+-]?\d+(?:\.\d+)?)\s*db\s*/\s*(?P<delta>[+-]?\d+(?:\.\d+)?)\s*db\)",
     re.IGNORECASE,
 )
-TIME_RANGE_SEPARATOR = " to "
+MAX_SUBTITLE_LINES = 12
 folder_mapping = { '<Zeng Zheng>-<DVD1>': 'cdrt-8-9',
                    '<Zeng Zheng>-<DVD2>': 'cdrt-10-12-1'}
 char_mapping = { '<': '＜', '>': '＞'}
 excluded_files = { '＜19 October 2025＞-＜11-39-03＞-＜kitchen noises＞.mp4'}
-included_files = { '13 October 2025' }
-
+included_files = { '13 October 2025', 
+                   '＜15 October 2025＞-＜20-13-44＞-＜kitchen noises (sound level meter)＞',
+                   '＜01 January 2026＞' }
 
 def matches_any_partial_name(value: str, patterns: set[str]) -> bool:
     return any(pattern and pattern in value for pattern in patterns)
@@ -110,15 +111,20 @@ def count_events_in_line(line: str, threshold: float, metric: str) -> int:
 
     count = 0
     for event_text in events_field.split(";"):
-        match = EVENT_DB_PATTERN.search(event_text)
-        if not match:
+        value = event_db_value(event_text, metric)
+        if value is None:
             continue
-
-        value = float(match.group(metric))
         if value >= threshold:
             count += 1
 
     return count
+
+
+def event_db_value(event_text: str, metric: str = "delta") -> float | None:
+    match = EVENT_DB_PATTERN.search(event_text)
+    if not match:
+        return None
+    return float(match.group(metric))
 
 def sec_to_srt_timestamp(x: int) -> str:
     hours = x // 3600
@@ -133,7 +139,7 @@ def hhmmss_to_seconds(value: str) -> int:
 
 
 def parse_time_range(time_range: str) -> tuple[int, int]:
-    start_text, end_text = (part.strip() for part in time_range.split(TIME_RANGE_SEPARATOR, 1))
+    start_text, end_text = (part.strip() for part in time_range.split(" to ", 1))
     return hhmmss_to_seconds(start_text), hhmmss_to_seconds(end_text)
 
 
@@ -171,6 +177,146 @@ def merge_playback_segments(
     return merged_segments
 
 
+def merge_subtitle_rows(
+    rows: list[tuple[str, str]], max_gap_seconds: int = 0
+) -> list[tuple[int, int, list[str]]]:
+    if not rows:
+        return []
+
+    merged_rows: list[tuple[int, int, list[str]]] = []
+    current_start_seconds, current_end_seconds = subtitle_time_bounds(
+        *parse_time_range(rows[0][0])
+    )
+    current_entries = [subtitle_entry(rows[0][0], rows[0][1])]
+
+    for time_range, events_field in rows[1:]:
+        start_seconds, end_seconds = parse_time_range(time_range)
+        subtitle_start, subtitle_end = subtitle_time_bounds(start_seconds, end_seconds)
+        entry = subtitle_entry(time_range, events_field)
+
+        if subtitle_start <= current_end_seconds + max_gap_seconds:
+            current_end_seconds = max(current_end_seconds, subtitle_end)
+            current_entries.append(entry)
+            continue
+
+        merged_rows.append(
+            (
+                current_start_seconds,
+                current_end_seconds,
+                flatten_subtitle_entries(
+                    trim_subtitle_entries(current_entries, MAX_SUBTITLE_LINES)
+                ),
+            )
+        )
+        current_start_seconds = subtitle_start
+        current_end_seconds = subtitle_end
+        current_entries = [entry]
+
+    merged_rows.append(
+        (
+            current_start_seconds,
+            current_end_seconds,
+            flatten_subtitle_entries(
+                trim_subtitle_entries(current_entries, MAX_SUBTITLE_LINES)
+            ),
+        )
+    )
+    return merged_rows
+
+
+def subtitle_entry(time_range: str, events_field: str) -> tuple[str, list[str]]:
+    return (
+        time_range,
+        [event_text.strip() for event_text in events_field.split(";") if event_text.strip()],
+    )
+
+
+def trim_subtitle_entries(
+    entries: list[tuple[str, list[str]]], max_total_lines: int
+) -> list[tuple[str, list[str]]]:
+    structured_entries = [
+        {
+            "time_range": time_range,
+            "events": [
+                {
+                    "text": event_text,
+                    "delta": event_db_value(event_text, "delta"),
+                }
+                for event_text in event_lines
+            ],
+        }
+        for time_range, event_lines in entries
+    ]
+
+    total_lines = sum(1 + len(entry["events"]) for entry in structured_entries)
+    if total_lines <= max_total_lines:
+        return entries
+
+    while total_lines > max_total_lines:
+        removable_entry_indexes = [
+            entry_index
+            for entry_index, entry in enumerate(structured_entries)
+            if entry["events"]
+        ]
+        if not removable_entry_indexes:
+            break
+
+        lowest_priority_entry_index = min(
+            removable_entry_indexes,
+            key=lambda entry_index: (
+                max(
+                    event["delta"] if event["delta"] is not None else float("inf")
+                    for event in structured_entries[entry_index]["events"]
+                ),
+                len(structured_entries[entry_index]["events"]),
+                entry_index,
+            ),
+        )
+        entry_line_count = 1 + len(structured_entries[lowest_priority_entry_index]["events"])
+        if total_lines - entry_line_count >= max_total_lines:
+            structured_entries[lowest_priority_entry_index]["events"] = []
+            total_lines -= entry_line_count
+            continue
+        break
+
+    removable_events = sorted(
+        (
+            event["delta"] if event["delta"] is not None else float("inf"),
+            entry_index,
+            event_index,
+        )
+        for entry_index, entry in enumerate(structured_entries)
+        for event_index, event in enumerate(entry["events"])
+    )
+
+    for _, entry_index, event_index in removable_events:
+        if total_lines <= max_total_lines:
+            break
+        entry = structured_entries[entry_index]
+        event = entry["events"][event_index]
+        if event is None:
+            continue
+        entry["events"][event_index] = None
+        total_lines -= 1
+        if not any(remaining is not None for remaining in entry["events"]):
+            total_lines -= 1
+
+    trimmed_entries: list[tuple[str, list[str]]] = []
+    for entry in structured_entries:
+        event_lines = [event["text"] for event in entry["events"] if event is not None]
+        if event_lines:
+            trimmed_entries.append((entry["time_range"], event_lines))
+    return trimmed_entries
+
+
+def flatten_subtitle_entries(entries: list[tuple[str, list[str]]]) -> list[str]:
+    subtitle_lines: list[str] = []
+    for time_range, event_lines in entries:
+        subtitle_lines.append(time_range)
+        subtitle_lines.extend(event_lines)
+    return subtitle_lines
+
+
 def resolve_output_path(path: Path, output_dir: Path | None) -> Path:
     if output_dir is None:
         return path
@@ -187,6 +333,8 @@ def build_vlc_python(
     segments_block = "\n".join(segment_lines)
 
     return (
+        "import queue\n"
+        "import threading\n"
         "import time\n"
         "import vlc\n"
         "from pathlib import Path\n\n"
@@ -194,22 +342,84 @@ def build_vlc_python(
         "segments = [\n"
         f"{segments_block}\n"
         "]\n\n"
+        "command_queue = queue.SimpleQueue()\n\n"
+        "def read_navigation_keys():\n"
+        "    try:\n"
+        "        import msvcrt\n"
+        "    except ImportError:\n"
+            "        import select\n"
+            "        import sys\n"
+            "        import termios\n"
+            "        import tty\n\n"
+            "        stdin = sys.stdin.fileno()\n"
+            "        original_settings = termios.tcgetattr(stdin)\n"
+            "        try:\n"
+            "            tty.setcbreak(stdin)\n"
+            "            while True:\n"
+            "                ready, _, _ = select.select([sys.stdin], [], [], 0.1)\n"
+            "                if not ready:\n"
+            "                    continue\n"
+            "                key = sys.stdin.read(1)\n"
+            "                if key != \"\\x1b\":\n"
+            "                    continue\n"
+            "                if not select.select([sys.stdin], [], [], 0.05)[0]:\n"
+            "                    continue\n"
+            "                if sys.stdin.read(1) != \"[\":\n"
+            "                    continue\n"
+            "                if not select.select([sys.stdin], [], [], 0.05)[0]:\n"
+            "                    continue\n"
+            "                key = sys.stdin.read(1)\n"
+            "                if key == \"D\":\n"
+            "                    command_queue.put(\"prev\")\n"
+            "                elif key == \"C\":\n"
+            "                    command_queue.put(\"next\")\n"
+            "        finally:\n"
+            "            termios.tcsetattr(stdin, termios.TCSADRAIN, original_settings)\n"
+            "        return\n\n"
+            "    while True:\n"
+            "        key = msvcrt.getch()\n"
+            "        if key not in (b\"\\x00\", b\"\\xe0\"):\n"
+            "            continue\n"
+            "        key = msvcrt.getch()\n"
+            "        if key == b\"K\":\n"
+            "            command_queue.put(\"prev\")\n"
+            "        elif key == b\"M\":\n"
+            "            command_queue.put(\"next\")\n\n"
+        "def wait_for_command_or_timeout(duration):\n"
+        "    end_time = time.monotonic() + duration\n"
+        "    while time.monotonic() < end_time:\n"
+        "        try:\n"
+        "            return command_queue.get_nowait()\n"
+        "        except queue.Empty:\n"
+        "            time.sleep(0.1)\n"
+        "    return None\n\n"
         "instance = vlc.Instance()\n"
         "player = instance.media_player_new()\n"
         "media = instance.media_new(str(video))\n"
         "player.set_media(media)\n\n"
+        "threading.Thread(target=read_navigation_keys, daemon=True).start()\n"
+        "print(\"Controls: Left Arrow = previous event, Right Arrow = next event\")\n\n"
         "player.play()\n"
         "time.sleep(1.5)\n\n"
-        "for index, (start, duration) in enumerate(segments):\n"
+        "index = 0\n"
+        "while 0 <= index < len(segments):\n"
+        "    start, duration = segments[index]\n"
         "    start_label = f\"{start // 60:02d}:{start % 60:02d}\"\n"
-        "    print(f\"Playing {start_label} for {duration}s\")\n"
+        "    print(f\"Playing {index + 1}/{len(segments)} {start_label} for {duration}s\")\n"
         "    player.set_time(start * 1000)\n"
         "    time.sleep(0.2)\n"
         "    player.play()\n"
-        "    time.sleep(duration)\n"
+        "    command = wait_for_command_or_timeout(duration)\n"
         "    player.pause()\n"
+        "    if command == \"prev\":\n"
+        "        index = max(0, index - 1)\n"
+        "        continue\n"
+        "    if command == \"next\":\n"
+        "        index += 1\n"
+        "        continue\n"
         "    if index < len(segments) - 1:\n"
         "        time.sleep(1)\n\n"
+        "    index += 1\n\n"
         "player.stop()\n"
     )
 
@@ -234,16 +444,17 @@ def main() -> int:
     with args.input_file.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             _, original_name, source_file, formatted_filename, time_range, events_field = split_record_fields(line)
-            if source_file and (
+            is_included_file = source_file and (
                 matches_any_partial_name(original_name, included_files)
                 or matches_any_partial_name(formatted_filename, included_files)
-            ):
+            )
+            if is_included_file:
                 included_output_files.add(source_file)
             line_count = count_events_in_line(line, args.threshold, args.metric)
             total_count += line_count
             if (args.output_kept_script or args.output_srt_files) and source_file:
                 save_line = True
-                if args.kept_file_event_db_thres is not None:
+                if args.kept_file_event_db_thres is not None and not is_included_file:
                     save_line = (
                         count_events_in_line(
                             line, args.kept_file_event_db_thres, args.metric
@@ -316,21 +527,16 @@ def main() -> int:
             )
             srt_path.parent.mkdir(parents=True, exist_ok=True)
             playback_segments: list[tuple[int, int]] = []
+            merged_subtitle_rows = merge_subtitle_rows(rows)
             with srt_path.open("w", encoding="utf-8") as handle:
                 for index, (time_range, events_field) in enumerate(rows, start=1):
                     start_seconds, end_seconds = parse_time_range(time_range)
-                    subtitle_start, subtitle_end = subtitle_time_bounds(
-                        start_seconds, end_seconds
-                    )
                     playback_segments.append(
                         playback_segment(start_seconds, end_seconds)
                     )
-                    subtitle_lines = [time_range]
-                    subtitle_lines.extend(
-                        event_text.strip()
-                        for event_text in events_field.split(";")
-                        if event_text.strip()
-                    )
+                for index, (subtitle_start, subtitle_end, subtitle_lines) in enumerate(
+                    merged_subtitle_rows, start=1
+                ):
                     handle.write(f"{index}\n")
                     handle.write(
                         f"{sec_to_srt_timestamp(subtitle_start)} --> {sec_to_srt_timestamp(subtitle_end)}\n"
